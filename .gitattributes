@@ -1,0 +1,3 @@
+# Preserve exact source bytes: several runtime modules verify source hashes.
+# Prevent Windows checkout from silently replacing LF with CRLF.
+* -text

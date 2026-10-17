@@ -3,6 +3,11 @@
   "contains_runtime_data": false,
   "files": [
     {
+      "path": ".gitattributes",
+      "bytes": 153,
+      "sha256": "7b74198c351f5c49cd85395ac59067de9a0cce2180020ea13aa46a25a6424e76"
+    },
+    {
       "path": ".gitignore",
       "bytes": 298,
       "sha256": "41feec4ca3acf711e419bbd3c73737be3dab9e54804306dc794041edf24b46e9"
