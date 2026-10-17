@@ -1,0 +1,7 @@
+FROM python:3.12-alpine
+WORKDIR /app
+COPY owner_portal.py owner_schema.py trace_schema.py catalog.py replay_schema.py /app/
+COPY private /app/private
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+USER 10001:10001
+CMD ["python", "/app/owner_portal.py"]

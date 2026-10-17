@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Fixed-provider gateway. No arbitrary URLs, no raw request logging."""
+import sys,re,fcntl,socket,base64,subprocess,ipaddress
+import os,json,secrets,hmac,urllib.request,urllib.error,threading,time
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+ROOT=Path('/opt/awema-ops/model-gateway');MAX=2*1024*1024
+OLLAMA_NETWORK='awema-ai_default';OLLAMA_CONTAINER='ollama';OLLAMA_MODEL='qwen3-4b-8k-test'
+CAPACITY_WAIT_SECONDS=60;MAX_CAPACITY_WAITERS=4
+class ProviderResponseError(ValueError):
+ pass
+
+class RunBudgetExceeded(ValueError):
+ def __init__(self,reason,lease):
+  super().__init__(reason);self.reason=reason;self.lease={k:lease.get(k) for k in ('task','run','calls','bytes')}
+
+class BoundedServer(ThreadingHTTPServer):
+ def __init__(self,*args):
+  super().__init__(*args);self.connections=threading.BoundedSemaphore(16)
+ def process_request(self,request,address):
+  if not self.connections.acquire(blocking=False):self.shutdown_request(request);return
+  try:super().process_request(request,address)
+  except Exception:self.connections.release();raise
+ def process_request_thread(self,request,address):
+  try:super().process_request_thread(request,address)
+  finally:self.connections.release()
+def record(server,entry):
+ if hasattr(server,'opposable'):server.opposable(entry)
+ with server.stats_lock:
+  with (ROOT/'requests.jsonl').open('a') as f:
+   f.write(json.dumps(entry)+'\n');f.flush();os.fsync(f.fileno())
+def provider_secret_rpc():
+ q={'op':'get','profile':'model-gateway','secret':'model-gateway/deepseek-provider','actor_token':Path('/etc/awema/v2/tokens/model-gateway.token').read_text(),'correlation_id':'provider-access-'+secrets.token_hex(12)}
+ deadline=time.monotonic()+15
+ with socket.socket(socket.AF_UNIX) as connection:
+  connection.settimeout(max(.01,deadline-time.monotonic()));connection.connect('/opt/awema-ai/core/data/broker/vault.sock');connection.settimeout(max(.01,deadline-time.monotonic()));connection.sendall((json.dumps(q)+'\n').encode());raw=b''
+  while b'\n' not in raw:
+   remaining=deadline-time.monotonic()
+   if remaining<=0:raise TimeoutError('vault RPC deadline')
+   connection.settimeout(remaining);part=connection.recv(8192)
+   if not part:break
+   raw+=part
+   if len(raw)>131072:raise ValueError('bounded vault response')
+ if time.monotonic()>=deadline:raise TimeoutError('vault RPC deadline')
+ response=json.loads(raw.splitlines()[0])
+ if response.get('ok') is not True:raise ValueError('provider vault access refused')
+ key=base64.b64decode(response['valeur_b64'],validate=True).decode().strip()
+ if not 10<len(key)<8192:raise ValueError('provider credential format denied')
+ return key
+def completion_choice(response):
+ if not isinstance(response,dict):raise ProviderResponseError('provider response object required')
+ choices=response.get('choices')
+ if not isinstance(choices,list) or len(choices)!=1 or not isinstance(choices[0],dict):raise ProviderResponseError('single provider choice required')
+ choice=choices[0];message=choice.get('message')
+ if not isinstance(message,dict):raise ProviderResponseError('provider message schema')
+ content=message.get('content');refusal=message.get('refusal');calls=message.get('tool_calls');legacy=message.get('function_call')
+ if content is not None and not isinstance(content,str):raise ProviderResponseError('provider content schema')
+ if refusal is not None and not isinstance(refusal,str):raise ProviderResponseError('provider refusal schema')
+ if calls is not None:
+  if not isinstance(calls,list) or len(calls)>128:raise ProviderResponseError('provider tool schema')
+  for call in calls:
+   if not isinstance(call,dict) or not isinstance(call.get('id'),str) or not call['id'] or call.get('type')!='function':raise ProviderResponseError('provider tool schema')
+   function=call.get('function')
+   if not isinstance(function,dict) or not isinstance(function.get('name'),str) or not function['name'] or not isinstance(function.get('arguments'),str):raise ProviderResponseError('provider tool schema')
+ if legacy is not None and (not isinstance(legacy,dict) or not isinstance(legacy.get('name'),str) or not legacy['name'] or not isinstance(legacy.get('arguments'),str)):raise ProviderResponseError('provider function schema')
+ if not (isinstance(content,str) and content.strip() or isinstance(refusal,str) and refusal.strip() or calls or legacy):raise ProviderResponseError('empty provider completion')
+ return choice
+
+def provider_attempt_budget(total):
+ # Preserve a useful local attempt after a cloud timeout, within the same total
+ # lease/request deadline. A fallback is an inference, never a replayed tool.
+ return total-min(60,max(30,total//3))
+
+def buffered_sse(body):
+ response=json.loads(body);choice=completion_choice(response);message=choice['message']
+ delta={k:v for k,v in message.items() if k in ['role','content','tool_calls','reasoning_content','refusal','function_call']}
+ if 'tool_calls' in delta:delta['tool_calls']=[dict(call,index=i) for i,call in enumerate(delta['tool_calls'])]
+ common={'id':response.get('id','buffered-response'),'object':'chat.completion.chunk','created':response.get('created',int(time.time())),'model':response.get('model','deepseek-flash')}
+ first=dict(common,choices=[{'index':0,'delta':delta,'finish_reason':None}])
+ last=dict(common,choices=[{'index':0,'delta':{},'finish_reason':choice.get('finish_reason','stop')}])
+ chunks=[first,last]
+ if response.get('usage'):chunks.append(dict(common,choices=[],usage=response['usage']))
+ data=b''.join(('data: '+json.dumps(x)+'\n\n').encode() for x in chunks)+b'data: [DONE]\n\n'
+ if len(data)>8*1024*1024:raise ValueError('bounded SSE response')
+ return data
+def ollama_base_url(server):
+ configured=getattr(server,'ollama_base_url',None)
+ if configured:return configured.rstrip('/')
+ result=subprocess.run(['/usr/bin/docker','inspect','--format','{{with index .NetworkSettings.Networks "'+OLLAMA_NETWORK+'"}}{{.IPAddress}}{{end}}',OLLAMA_CONTAINER],capture_output=True,text=True,timeout=3,check=True)
+ address=ipaddress.ip_address(result.stdout.strip())
+ if address.version!=4 or not address.is_private or address.is_loopback or address.is_link_local:raise ValueError('Ollama address outside private network')
+ return 'http://'+str(address)+':11434/v1'
+def fallback_reason(exc):
+ if isinstance(exc,ProviderResponseError):return 'invalid_response'
+ if isinstance(exc,urllib.error.HTTPError):
+  code=exc.code
+  if code in (401,403,408,425,429) or 500<=code<=599:return 'http_'+str(code)
+  return None
+ if isinstance(exc,urllib.error.URLError):
+  return 'network_timeout' if isinstance(exc.reason,(TimeoutError,socket.timeout)) else 'network_error'
+ if isinstance(exc,(TimeoutError,socket.timeout,ConnectionError)):return 'network_timeout' if isinstance(exc,(TimeoutError,socket.timeout)) else 'network_error'
+ return None
+def ollama_request_payload(req):
+ supported={'messages','max_tokens','temperature','top_p','tools','tool_choice','stop','response_format','frequency_penalty','presence_penalty','reasoning_effort'}
+ payload={k:v for k,v in req.items() if k in supported}
+ payload['model']=OLLAMA_MODEL;payload['stream']=False;payload['reasoning_effort']='none'
+ if 'max_tokens' not in payload and type(req.get('max_completion_tokens')) is int:payload['max_tokens']=req['max_completion_tokens']
+ return payload
+def acquire_capacity(server,timeout=CAPACITY_WAIT_SECONDS):
+ started=time.monotonic()
+ if server.capacity.acquire(blocking=False):return True,'immediate',0.0
+ with server.capacity_waiters_lock:
+  if server.capacity_waiters>=server.max_capacity_waiters:return False,'queue_full',round(time.monotonic()-started,3)
+  server.capacity_waiters+=1
+ try:
+  acquired=server.capacity.acquire(timeout=timeout)
+  return acquired,'queued' if acquired else 'queue_timeout',round(time.monotonic()-started,3)
+ finally:
+  with server.capacity_waiters_lock:server.capacity_waiters-=1
+def fetch_completion(server,request,started,budget,client_stream,provider,role,operation,lease):
+ with urllib.request.urlopen(request,timeout=max(.01,budget-(time.monotonic()-started))) as response:
+  record(server,{'event':'model_response_headers','role':role,'operation':operation,'task':lease['task'],'run':lease['run'],'provider':provider,'seconds':round(time.monotonic()-started,3),'client_stream':client_stream,'upstream_stream':False,'content_type':response.headers.get('Content-Type','').split(';')[0] if response.headers.get('Content-Type','').split(';')[0] in ['application/json','text/event-stream','text/plain'] else 'other'})
+  remaining=budget-(time.monotonic()-started)
+  if remaining<=0:raise TimeoutError('provider deadline before body')
+  if response.headers.get('Content-Encoding','identity')!='identity':raise ValueError('compressed provider response refused')
+  upstream_socket=response.fp.raw._sock
+  def stop_upstream():
+   try:upstream_socket.shutdown(socket.SHUT_RDWR)
+   except OSError:pass
+  upstream_timer=threading.Timer(remaining,stop_upstream);upstream_timer.daemon=True;upstream_timer.start()
+  try:
+   chunks=[];total=0
+   while time.monotonic()-started<budget:
+    chunk=response.read1(min(65536,8*1024*1024-total+1))
+    if not chunk:raise ProviderResponseError('incomplete JSON response')
+    total+=len(chunk)
+    if total>8*1024*1024:raise ProviderResponseError('response too large')
+    chunks.append(chunk);body=b''.join(chunks)
+    try:parsed=json.loads(body)
+    except (ValueError,UnicodeDecodeError):continue
+    completion_choice(parsed)
+    break
+   else:raise TimeoutError('provider deadline')
+   if time.monotonic()-started>=budget:raise TimeoutError('provider total deadline')
+   if client_stream:body=buffered_sse(body)
+   return body,response.status,'text/event-stream' if client_stream else 'application/json'
+  finally:upstream_timer.cancel()
+class Handler(BaseHTTPRequestHandler):
+ def setup(self):
+  super().setup();self.connection.settimeout(10)
+  self.deadline=threading.Timer(30,self.abort);self.deadline.daemon=True;self.deadline.start()
+ def abort(self):
+  try:self.connection.shutdown(2)
+  except OSError:pass
+ def finish(self):
+  self.deadline.cancel();super().finish()
+ def log_message(self,*args):pass
+ def reply(self,code,value):
+  data=json.dumps(value).encode();self.send_response(code);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+ def identity(self):
+  a=self.headers.get('Authorization','')
+  if not a.startswith('Bearer '):return None
+  token=a[7:]
+  if not token.isascii() or not 1<=len(token)<=8192:return None
+  tokens=json.loads((ROOT/'tokens.json').read_text()) if getattr(self.server,'dynamic_tokens',False) else self.server.tokens;matches=[n for n,v in tokens.items() if isinstance(v,str) and hmac.compare_digest(token,v)]
+  return matches[0] if len(matches)==1 else None
+ def do_GET(self):
+  if not self.identity():return self.reply(401,{'error':'unauthorized'})
+  if self.path!='/v1/models':return self.reply(404,{'error':'endpoint denied'})
+  self.reply(200,{'object':'list','data':[{'id':'deepseek-flash','object':'model','owned_by':'deepseek'}]})
+ def do_POST(self):
+  role=self.identity()
+  if not role:return self.reply(401,{'error':'unauthorized'})
+  if self.path!='/v1/chat/completions':return self.reply(404,{'error':'endpoint denied'})
+  try:
+   size=int(self.headers.get('Content-Length','0'))
+   if size<=0 or size>MAX:return self.reply(413,{'error':'request size denied'})
+   self.connection.settimeout(15);raw=self.rfile.read(size)
+   if len(raw)!=size:raise ValueError()
+   req=json.loads(raw)
+   if req.get('model')!='deepseek-flash' or not isinstance(req.get('messages'),list):return self.reply(400,{'error':'model/request denied'})
+   allowed={'model','messages','max_tokens','max_completion_tokens','temperature','top_p','stream','stream_options','tools','tool_choice','parallel_tool_calls','stop','response_format','frequency_penalty','presence_penalty','reasoning_effort','thinking'}
+   if set(req)-allowed:
+    fields=[k for k in sorted(set(req)-allowed) if re.fullmatch(r'[a-z_]{1,40}',k)]
+    (ROOT/'last-denied-fields.json').write_text(json.dumps({'role':role,'fields':fields,'provider_called':False}))
+    return self.reply(400,{'error':'reserved field denied','fields':fields})
+   if 'stream' in req and type(req['stream']) is not bool:return self.reply(400,{'error':'stream parameter denied'})
+   if 'thinking' in req and req['thinking'] not in [{'type':'enabled'},{'type':'disabled'}]:return self.reply(400,{'error':'thinking parameter denied'})
+   for field in ['max_tokens','max_completion_tokens']:
+    if field in req and (type(req[field]) is not int or not 1<=req[field]<=8192):return self.reply(400,{'error':'token limit denied'})
+   if 'max_tokens' not in req and 'max_completion_tokens' not in req:req['max_tokens']=8192
+  except Exception:return self.reply(400,{'error':'invalid request'})
+  # A short bounded queue avoids turning harmless parallel completions into
+  # immediate 429s while preserving the single-inference memory limit.
+  self.deadline.cancel();self.deadline=threading.Timer(CAPACITY_WAIT_SECONDS+30,self.abort);self.deadline.daemon=True;self.deadline.start()
+  capacity_acquired,capacity_state,queue_wait=acquire_capacity(self.server)
+  if not capacity_acquired:return self.reply(503 if capacity_state=='queue_timeout' else 429,{'error':'worker capacity queue is '+capacity_state,'retry_allowed':False,'queue_wait_seconds':queue_wait})
+  code=400;started=time.monotonic();operation=secrets.token_hex(16)
+  try:
+   lease=self.server.authorize_run(role,self.client_address[0],size)
+   provider_budget=lease.get('request_timeout_seconds',120)
+   if type(provider_budget) is not int or not 120<=provider_budget<=650:raise ValueError('provider timeout policy denied')
+   self.deadline.cancel();self.deadline=threading.Timer(provider_budget+30,self.abort);self.deadline.daemon=True;self.deadline.start()
+  except RunBudgetExceeded as exc:
+   self.server.capacity.release()
+   try:record(self.server,dict(exc.lease,event='model_run_budget_exhausted',role=role,operation=operation,reason=exc.reason,status=429,provider_called=False))
+   except Exception:pass
+   return self.reply(429,{'error':{'message':'AWEMA internal run budget exhausted; provider credentials are not involved.','type':'awema_run_budget_exhausted','code':exc.reason},'retry_allowed':False})
+  except Exception:
+   self.server.capacity.release();return self.reply(403,{'error':'AWEMA run authorization denied; provider not called'})
+  try:
+   provider_key=self.server.get_provider_key()
+   record(self.server,{'event':'model_request_intent','role':role,'operation':operation,'timestamp':time.time(),'task':lease['task'],'run':lease['run'],'capacity_state':capacity_state,'queue_wait_seconds':queue_wait})
+  except Exception:
+   self.server.capacity.release();return self.reply(503,{'error':'audit or vault unavailable; provider not called'})
+  capacity_released=False
+  try:
+   upstream_request=dict(req,stream=False);upstream_request.pop('stream_options',None)
+   payload=json.dumps(upstream_request).encode();up=urllib.request.Request('https://api.deepseek.com/v1/chat/completions',data=payload,headers={'Authorization':'Bearer '+provider_key,'Content-Type':'application/json','Accept-Encoding':'identity'})
+   try:
+    body,code,content_type=fetch_completion(self.server,up,started,provider_attempt_budget(provider_budget),bool(req.get('stream')),'deepseek',role,operation,lease)
+    provider='deepseek';actual_model='deepseek-flash'
+   except Exception as primary_error:
+    reason=fallback_reason(primary_error)
+    if reason is None:raise
+    record(self.server,{'event':'model_fallback_activated','role':role,'operation':operation,'task':lease['task'],'run':lease['run'],'from_provider':'deepseek','from_model':'deepseek-flash','to_provider':'ollama','to_model':OLLAMA_MODEL,'reason':reason})
+    fallback_payload=ollama_request_payload(req)
+    fallback=urllib.request.Request(ollama_base_url(self.server)+'/chat/completions',data=json.dumps(fallback_payload).encode(),headers={'Content-Type':'application/json','Accept-Encoding':'identity'})
+    try:
+     body,code,content_type=fetch_completion(self.server,fallback,started,provider_budget,bool(req.get('stream')),'ollama',role,operation,lease)
+    except Exception as fallback_error:
+     failure={'event':'model_fallback_failed','role':role,'operation':operation,'task':lease['task'],'run':lease['run'],'provider':'ollama','model':OLLAMA_MODEL,'reason':reason,'error_class':type(fallback_error).__name__}
+     if isinstance(primary_error,urllib.error.HTTPError):failure['primary_status']=primary_error.code
+     if isinstance(fallback_error,urllib.error.HTTPError):failure['fallback_status']=fallback_error.code
+     record(self.server,failure)
+     code=503
+     message={'error':'DeepSeek failed and the local model fallback was unavailable','fallback_provider':'ollama','fallback_model':OLLAMA_MODEL,'fallback_error':type(fallback_error).__name__,'retry_allowed':False}
+     if isinstance(primary_error,urllib.error.HTTPError):message['primary_status']=primary_error.code
+     return self.reply(code,message)
+    provider='ollama';actual_model=OLLAMA_MODEL
+    record(self.server,{'event':'model_fallback_completed','role':role,'operation':operation,'task':lease['task'],'run':lease['run'],'from_provider':'deepseek','from_model':'deepseek-flash','provider':'ollama','model':OLLAMA_MODEL,'reason':reason})
+   try:record(self.server,{'event':'model_request_confirmed','role':role,'operation':operation,'task':lease['task'],'run':lease['run'],'status':code,'provider':provider,'model':actual_model,'seconds':round(time.monotonic()-started,3)})
+   except Exception:return self.reply(400,{'error':'audit confirmation unavailable','effect_uncertain':True,'retry_allowed':False})
+    # Provider effect and audit confirmation are complete. Release before making
+    # the response visible: the SDK may immediately send its next tool turn.
+   self.server.capacity.release();capacity_released=True
+   self.send_response(code);self.send_header('Content-Type',content_type);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+  except Exception as exc:
+   failed={'event':'model_request_failed','role':role,'operation':operation,'task':lease['task'],'run':lease['run'],'exception':type(exc).__name__,'seconds':round(time.monotonic()-started,3),'body_bytes':locals().get('total',0),'non_whitespace_bytes':sum(len(x.strip()) for x in locals().get('chunks',[]))}
+   if isinstance(exc,urllib.error.HTTPError):failed['upstream_status']=exc.code
+   try:record(self.server,failed)
+   except Exception:pass
+   self.reply(400,{'error':'provider result uncertain','effect_uncertain':True,'retry_allowed':False})
+  finally:
+   if not capacity_released:self.server.capacity.release()
+   try:record(self.server,{'event':'model_request_finished','role':role,'operation':operation,'task':lease['task'],'run':lease['run'],'status':code})
+   except Exception:pass
+def authorize_run(role,peer,size):
+ with (ROOT/'lease.lock').open('a') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  p=ROOT/'leases'/(role+'.json');lease=json.loads(p.read_text())
+  if not isinstance(lease.get('task'),str) or not re.fullmatch(r't_[a-f0-9]{8}',lease['task']) or type(lease.get('run')) is not int or lease['run']<1:raise ValueError('run schema denied')
+  if lease.get('peer')!=peer or not time.time()<lease.get('expires',0):raise ValueError('run authorization denied')
+  max_calls=lease.get('max_calls',40);max_bytes=lease.get('max_bytes',8*1024*1024)
+  if type(max_calls) is not int or not 1<=max_calls<=240 or type(max_bytes) is not int or not 1<=max_bytes<=96*1024*1024:raise ValueError('run budget policy denied')
+  if lease.get('calls',0)>=max_calls:raise RunBudgetExceeded('calls',lease)
+  if lease.get('bytes',0)+size>max_bytes:raise RunBudgetExceeded('bytes',lease)
+  lease['calls']=lease.get('calls',0)+1;lease['bytes']=lease.get('bytes',0)+size
+  temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(lease))
+  with temporary.open('r+') as f:f.flush();os.fsync(f.fileno())
+  os.replace(temporary,p)
+  return lease
+def serve():
+ os.umask(0o077)
+ sys.path.insert(0,'/opt/awema-ai/core/bin')
+ import awema_audit_lib as audit
+ def opposable(e):
+  return audit.emettre('/opt/awema-ai/core',e['event'],tool='awema-model-gateway',target='model:deepseek-flash',correlation_id=e['operation'],acteur='model-gateway',token=Path('/etc/awema/v2/tokens/model-gateway.token').read_text(),task=('TASK-NATIVE-'+e['task'][2:]) if e.get('task') else None,project='awema-ai-team',detail={k:v for k,v in e.items() if k not in ['event','operation']})
+ tokens=json.loads((ROOT/'tokens.json').read_text())
+ bind=os.environ['AWEMA_MODEL_BIND'];server=BoundedServer((bind,18090),Handler);server.daemon_threads=True;server.tokens=tokens;server.get_provider_key=provider_secret_rpc;server.capacity=threading.BoundedSemaphore(1);server.capacity_waiters=0;server.capacity_waiters_lock=threading.Lock();server.max_capacity_waiters=MAX_CAPACITY_WAITERS;server.stats_lock=threading.Lock();server.authorize_run=authorize_run;server.opposable=opposable;server.dynamic_tokens=True;server.serve_forever()
+if __name__=='__main__':serve()

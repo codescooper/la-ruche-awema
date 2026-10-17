@@ -1,0 +1,160 @@
+{
+  "schema": "awema-capability-kits-v1",
+  "release": "awema-kits-20261017-v1",
+  "version": "1.0.0",
+  "loader_sha256": "e420a61081cbdab2d7e16a1ae994cc4d9ba36ef2128a6923da0772d1c5fe3b4e",
+  "native_roles": [
+    "assa",
+    "cl-producer",
+    "cto",
+    "designer",
+    "dev",
+    "ops",
+    "pm",
+    "qa",
+    "security"
+  ],
+  "conversation_roles": [
+    "accounting",
+    "assistant",
+    "finance"
+  ],
+  "common": {
+    "common/METHOD.md": "3d4b5cd6d7eebae54afc7bbcc1290f391f91403b9b1bf39f5895c5920c619dc5",
+    "common/PROOFS.md": "57a053696ec962543792320f400b3954dcb50aedd52d958870b4a5df62c6cc96"
+  },
+  "kits": {
+    "cto": {
+      "id": "awema.cto",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/cto/METHOD.md": "c3dec670cb23a6d47f86d13f6e356fee6495d84d84fd6eedc2bf71820f1255b9",
+        "roles/cto/CHECKLIST.md": "77f9267143420df82da1779da9ead362f3313fd92864e92e80c020d655b54ebd",
+        "roles/cto/TOOLS.json": "85a3a60eeea09a34011146e94e434c1652760343c170a8e5734ab2c9b12a8bd7"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "pm": {
+      "id": "awema.pm",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/pm/METHOD.md": "8efb3b33c9b86b680de9e194205400dd9300ba6a4b696a1e32abd60c065c463a",
+        "roles/pm/CHECKLIST.md": "f47bcb960a49ecfa05529a27530f46791340b084dc10641779aad2056290da22",
+        "roles/pm/TOOLS.json": "85a3a60eeea09a34011146e94e434c1652760343c170a8e5734ab2c9b12a8bd7"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "designer": {
+      "id": "awema.designer",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/designer/METHOD.md": "891b5743fa39f6f4077d30edc447e1b7a2dd244d5232897e0008bb082d1a140a",
+        "roles/designer/CHECKLIST.md": "98baeddada6c6d8b7637244fcb667f20b9aee774ccdce3eb3b6b8dd691c49c7b",
+        "roles/designer/TOOLS.json": "85a3a60eeea09a34011146e94e434c1652760343c170a8e5734ab2c9b12a8bd7"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "dev": {
+      "id": "awema.dev",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/dev/METHOD.md": "d3699acba34d091814e344d33039504b310a34619e368349fb93aa078dc5bc50",
+        "roles/dev/CHECKLIST.md": "726dd87f9a8218ab8d0213eab7378238e8b78c4b4d764b82801700f6415a4179",
+        "roles/dev/TOOLS.json": "4323997624b11841ba5ca03656ea557b4ab79cf29940a411415d33f85a4beed2"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "qa": {
+      "id": "awema.qa",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/qa/METHOD.md": "8b540d5a6bff8c99bd73108dfe5035e2ab51eb2f8ab01137b36ec7b34c4a9794",
+        "roles/qa/CHECKLIST.md": "48fe1c1d65572b642b9b144a7a3cbfe1d7057df6b5792cfeb850fe2879812778",
+        "roles/qa/TOOLS.json": "473f18af30702153332c57b15efe742d63f734d7d903f3665da80626542d0cca"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "security": {
+      "id": "awema.security",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/security/METHOD.md": "e57dea5dd0c900d9c166d7b3633c4c3652c394c96996f18f84c49f3077bc6dda",
+        "roles/security/CHECKLIST.md": "ef4fcfe309c062df8c2d1d37b008f4fe581d50f1e2239788f2af6f2910bdc367",
+        "roles/security/TOOLS.json": "85a3a60eeea09a34011146e94e434c1652760343c170a8e5734ab2c9b12a8bd7"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "ops": {
+      "id": "awema.ops",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/ops/METHOD.md": "0d94b867314bebf1cd8a577535eda54e3832d98d76fe2ef4cf644126173f349e",
+        "roles/ops/CHECKLIST.md": "7572b2e9391757c8af3ab32b70dbcb51dde22a0dd81a685cab0dbae17c1d1ae2",
+        "roles/ops/TOOLS.json": "85a3a60eeea09a34011146e94e434c1652760343c170a8e5734ab2c9b12a8bd7"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "assa": {
+      "id": "awema.assa",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/assa/METHOD.md": "9dfb4f460d5e0da692b5ae00d09fa6240e30f8e5324726c71076df436acb4a84",
+        "roles/assa/CHECKLIST.md": "c670045f82a45075a4fee7129442b13de3665b8c49c049eb13ca039f1da7336a",
+        "roles/assa/TOOLS.json": "85a3a60eeea09a34011146e94e434c1652760343c170a8e5734ab2c9b12a8bd7"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "cl-producer": {
+      "id": "awema.cl-producer",
+      "version": "1.0.0",
+      "mode": "native",
+      "files": {
+        "roles/cl-producer/METHOD.md": "140ecc6f4988554359f8245abaf4be1ccfc894f16175b50fcf03c1fc8c7778ce",
+        "roles/cl-producer/CHECKLIST.md": "f6db19f7c395c6fd38a977540f6124e842ad9d2f148ba473f225e57a9f1b6c8e",
+        "roles/cl-producer/TOOLS.json": "85a3a60eeea09a34011146e94e434c1652760343c170a8e5734ab2c9b12a8bd7"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "assistant": {
+      "id": "awema.assistant",
+      "version": "1.0.0",
+      "mode": "conversation-only",
+      "files": {
+        "roles/assistant/METHOD.md": "aa46fe10b7321b738e4716b6128a84d44640d8568386bfbd1577a6ffa2c54d3a",
+        "roles/assistant/CHECKLIST.md": "6bb4b42421ec68200d44c10eec01f4d7ab6e250013ddb7eb76caf5401e879a3d",
+        "roles/assistant/TOOLS.json": "f16a515692981536261fc9e482d6f4dae03a26977aa85db09a5f811a5ee9109a"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "accounting": {
+      "id": "awema.accounting",
+      "version": "1.0.0",
+      "mode": "conversation-only",
+      "files": {
+        "roles/accounting/METHOD.md": "0110e9e39ff2ea9e680abf15e3c064f35cfef7cb38d5df5c83bdf18acfcf6248",
+        "roles/accounting/CHECKLIST.md": "4a359bfc5998ba91dc416a219c3670c0f3a4eade1a0ea7b2c9ef72f0a997eabb",
+        "roles/accounting/TOOLS.json": "f16a515692981536261fc9e482d6f4dae03a26977aa85db09a5f811a5ee9109a"
+      },
+      "qualification": "candidate-not-business-certified"
+    },
+    "finance": {
+      "id": "awema.finance",
+      "version": "1.0.0",
+      "mode": "conversation-only",
+      "files": {
+        "roles/finance/METHOD.md": "2ff18066dfc6ae0dbe5c19351b38b8f5525df375ef6d7a6bafd1f3a00c0ce8bb",
+        "roles/finance/CHECKLIST.md": "20b5aaafb68ad7f498e722f220e571796d34bc9680944830806e51c100efbdea",
+        "roles/finance/TOOLS.json": "f16a515692981536261fc9e482d6f4dae03a26977aa85db09a5f811a5ee9109a"
+      },
+      "qualification": "candidate-not-business-certified"
+    }
+  }
+}

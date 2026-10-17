@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""awema-approve — approbations executoires du Control Plane AWEMA (contrat HOSTAPR v2).
+
+Remplace l'ancien outil ou toute chaine etait acceptee : le magasin est signe,
+le decideur est habilite et authentifie, l'approbation est a usage unique et
+liee a une action + une tache + un projet. Refus par defaut.
+
+Sous-commandes :
+  request        creer une demande (signee, avec expiration)
+  decide         approuver/refuser (jeton d'approbateur obligatoire)
+  consume        consommer une approbation (usage unique, liaisons strictes)
+  list           lister les approbations conformes (quarantaine des autres)
+  verify         controle d'integrite du magasin + rapprochement journal
+  export-hostapr produire le payload a soumettre au broker HOSTAPR v2
+  keygen         generer une cle de signature (hors magasin, mode 0600)
+"""
+import argparse
+import json
+import os
+import secrets
+import stat
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_approval_lib as A  # noqa: E402
+
+ROOT = Path(os.environ.get("AWEMA_CORE_ROOT", "/awema-core"))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="awema-approve")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sp.add_parser("request")
+    r.add_argument("--task", required=True)
+    r.add_argument("--action", required=True)
+    r.add_argument("--reason", required=True)
+    r.add_argument("--requester", required=True)
+    r.add_argument("--requester-kind", choices=["agent", "human"], default="agent")
+    r.add_argument("--ttl-seconds", type=int, default=None)
+
+    d = sp.add_parser("decide")
+    d.add_argument("id")
+    d.add_argument("decision", choices=["approved", "rejected"])
+    d.add_argument("--by", required=True)
+    d.add_argument("--token", default=None)
+
+    c = sp.add_parser("consume")
+    c.add_argument("id")
+    c.add_argument("--task", required=True)
+    c.add_argument("--project", required=True)
+    c.add_argument("--action", required=True)
+    c.add_argument("--actor", required=True)
+
+    sp.add_parser("list")
+    e = sp.add_parser("export-hostapr")
+    e.add_argument("id")
+
+    sp.add_parser("verify")
+
+    k = sp.add_parser("keygen")
+    k.add_argument("--path", required=True)
+    k.add_argument("--force", action="store_true")
+
+    a = ap.parse_args(argv)
+
+    if a.cmd == "keygen":
+        p = Path(a.path)
+        if p.exists() and not a.force:
+            raise SystemExit("REFUS: cle deja presente: " + str(p))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, secrets.token_hex(32).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(p, 0o600)
+        print(str(p))
+        return 0
+
+    if a.cmd == "request":
+        obj = A.demander(ROOT, a.task, a.action, a.reason, a.requester,
+                         a.requester_kind, a.ttl_seconds)
+        print(obj["id"])
+        return 0
+
+    if a.cmd == "decide":
+        token = a.token or os.environ.get("AWEMA_APPROVER_TOKEN")
+        obj = A.decider(ROOT, a.id, a.decision, a.by, token)
+        print(f"{obj['id']}: {obj['status']} par {obj['approver']}")
+        return 0
+
+    if a.cmd == "consume":
+        obj = A.consommer(ROOT, a.id, a.task, a.project, a.action, a.actor)
+        print(f"{obj['id']}: {obj['status']} par {obj['consumed_by']}")
+        return 0
+
+    if a.cmd == "list":
+        for o in A.lister(ROOT):
+            print(f"{o['id']}\t{o['status']}\t{o['task']}\t{o['project']}\t"
+                  f"{o['action']}\t{o['requester']}\t{o['approver'] or '-'}\t{o['expires_at']}")
+        return 0
+
+    if a.cmd == "export-hostapr":
+        c = A.contract(ROOT)
+        o = A.charger_apr(ROOT, a.id, c)
+        payload = {
+            "contract": A.HOSTAPR_CONTRACT,
+            "apr_id": o["id"],
+            "action": o["action"],
+            "task": o["task"],
+            "project": o["project"],
+            "requester": o["requester"],
+            "approver": o["approver"],
+            "decided_at": o["decided_at"],
+            "expires_at": o["expires_at"],
+            "nonce": o["nonce"],
+            "single_use": True,
+            "sig": o["sig"],
+        }
+        if o["status"] != "approved":
+            raise SystemExit(f"REFUS: approbation non approuvee ({o['status']})")
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if a.cmd == "verify":
+        rap = A.verifier_magasin(ROOT)
+        print(json.dumps(rap, ensure_ascii=False, indent=2))
+        return 0 if not rap["ecartes"] else 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except A.Refus as exc:
+        try:
+            A.journal(ROOT, "approval_refused", tool="awema-approve", detail=str(exc))
+        except A.Refus:
+            pass
+        print("REFUS: " + str(exc), file=sys.stderr)
+        sys.exit(64)

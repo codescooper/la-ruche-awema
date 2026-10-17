@@ -1,0 +1,41 @@
+{
+  "agents": [
+    {
+      "id": "cto",
+      "enabled": true
+    },
+    {
+      "id": "pm",
+      "enabled": true
+    },
+    {
+      "id": "designer",
+      "enabled": true
+    },
+    {
+      "id": "dev",
+      "enabled": true
+    },
+    {
+      "id": "qa",
+      "enabled": true
+    },
+    {
+      "id": "security",
+      "enabled": true
+    },
+    {
+      "id": "ops",
+      "enabled": true
+    },
+    {
+      "id": "finance",
+      "enabled": true
+    },
+    {
+      "id": "accounting",
+      "enabled": true
+    }
+  ],
+  "production_changes_require_explicit_approval": true
+}

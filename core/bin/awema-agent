@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""awema-agent — operations d'agent du Control Plane AWEMA.
+
+Version phase 3C.3 : la demande d'approbation passe par le magasin signe
+(contrat HOSTAPR v2) ; toutes les mutations ecrivent le journal AVANT la mutation
+et sont refusees si l'ecriture du journal echoue (fail-closed).
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_approval_lib as A  # noqa: E402
+
+ROOT = Path(os.environ.get("AWEMA_CORE_ROOT", "/awema-core"))
+TASKS = ROOT / "data/tasks"
+AGENTS = {"coordinator", "cto", "creative", "business", "ops"}
+ACTIVE = {"backlog", "todo", "in_progress", "ai_review", "human_review", "blocked"}
+
+
+def load(tid):
+    p = TASKS / (tid + ".json")
+    if not p.exists():
+        raise A.Refus("tache inexistante: " + tid)
+    return p, json.loads(p.read_text(encoding="utf-8"))
+
+
+def save(p, o):
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(o, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def agent_ok(a):
+    if a not in AGENTS:
+        raise A.Refus("agent inconnu: " + a)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="awema-agent")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    n = sp.add_parser("next")
+    n.add_argument("agent")
+    s = sp.add_parser("show")
+    s.add_argument("task")
+    c = sp.add_parser("claim")
+    c.add_argument("task")
+    c.add_argument("agent")
+    u = sp.add_parser("submit")
+    u.add_argument("task")
+    u.add_argument("agent")
+    u.add_argument("deliverable")
+    b = sp.add_parser("block")
+    b.add_argument("task")
+    b.add_argument("agent")
+    b.add_argument("reason")
+    r = sp.add_parser("request-approval")
+    r.add_argument("task")
+    r.add_argument("agent")
+    r.add_argument("action")
+    r.add_argument("reason")
+    r.add_argument("--requester-kind", choices=["agent", "human"], default="agent")
+    a = ap.parse_args(argv)
+
+    if a.cmd == "next":
+        agent_ok(a.agent)
+        candidats = []
+        for p in TASKS.glob("TASK-*.json"):
+            o = json.loads(p.read_text(encoding="utf-8"))
+            if o.get("assignee") == a.agent and o.get("status") in ACTIVE:
+                candidats.append(o)
+        candidats.sort(key=lambda x: (0 if x.get("priority") == "high" else 1,
+                                      x.get("created_at", "")))
+        print(json.dumps(candidats[0] if candidats else {}, ensure_ascii=False, indent=2))
+        return 0
+
+    if a.cmd == "show":
+        _, o = load(a.task)
+        print(json.dumps(o, ensure_ascii=False, indent=2))
+        return 0
+
+    if a.cmd == "claim":
+        agent_ok(a.agent)
+        p, o = load(a.task)
+        if o.get("assignee") != a.agent:
+            raise A.Refus("tache assignee a " + str(o.get("assignee")))
+        if o.get("status") not in {"backlog", "todo", "blocked", "in_progress"}:
+            raise A.Refus("statut non prenable: " + str(o.get("status")))
+        old = o["status"]
+        A.journal(ROOT, "agent_claimed", task=a.task, agent=a.agent, **{"from": old, "to": "in_progress"})
+        o["status"] = "in_progress"
+        o["claimed_by"] = a.agent
+        o["claimed_at"] = A.now()
+        o["updated_at"] = A.now()
+        save(p, o)
+        print("OK")
+        return 0
+
+    if a.cmd == "submit":
+        agent_ok(a.agent)
+        p, o = load(a.task)
+        if o.get("assignee") != a.agent:
+            raise A.Refus("mauvais agent")
+        if o.get("status") != "in_progress":
+            raise A.Refus("tache pas en cours")
+        cible = "ai_review" if a.agent != "coordinator" else "human_review"
+        A.journal(ROOT, "agent_submitted", task=a.task, agent=a.agent, deliverable=a.deliverable,
+                  **{"from": o.get("status"), "to": cible})
+        o.setdefault("deliverables", []).append(
+            {"by": a.agent, "value": a.deliverable, "at": A.now()})
+        o["status"] = cible
+        o["updated_at"] = A.now()
+        save(p, o)
+        print(o["status"])
+        return 0
+
+    if a.cmd == "block":
+        agent_ok(a.agent)
+        p, o = load(a.task)
+        if o.get("assignee") != a.agent:
+            raise A.Refus("mauvais agent")
+        A.journal(ROOT, "agent_blocked", task=a.task, agent=a.agent, reason=a.reason)
+        o["status"] = "blocked"
+        o.setdefault("notes", []).append(
+            {"by": a.agent, "type": "blocker", "value": a.reason, "at": A.now()})
+        o["updated_at"] = A.now()
+        save(p, o)
+        print("blocked")
+        return 0
+
+    if a.cmd == "request-approval":
+        agent_ok(a.agent)
+        _, o = load(a.task)
+        if o.get("assignee") != a.agent and a.agent != "coordinator":
+            raise A.Refus("agent non responsable")
+        obj = A.demander(ROOT, a.task, a.action, a.reason, a.agent, a.requester_kind)
+        print(obj["id"])
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except A.Refus as exc:
+        try:
+            A.journal(ROOT, "approval_refused", tool="awema-agent", detail=str(exc))
+        except A.Refus:
+            pass
+        print("REFUS: " + str(exc), file=sys.stderr)
+        sys.exit(64)

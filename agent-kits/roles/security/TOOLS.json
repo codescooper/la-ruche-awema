@@ -1,0 +1,19 @@
+{
+  "schema": "awema-role-tools-v1",
+  "mode": "native",
+  "available": [
+    "terminal",
+    "file"
+  ],
+  "conditional": [],
+  "unavailable": [
+    "host administration",
+    "production modification without explicit authorization",
+    "payments and transfers",
+    "external messaging",
+    "unmounted connectors",
+    "reference search unless explicitly supplied",
+    "image/audio/video generation unless explicitly supplied"
+  ],
+  "authority": "STAGE-and-native-authorization-only"
+}

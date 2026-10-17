@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "position_semantics": "presentation_seat_not_operational_location",
+  "rooms": [
+    {"id":"atrium","name":"Atrium","x":0,"y":0,"w":8,"d":5,"color":"#dcb77d","label":[3,1.6]},
+    {"id":"dev","name":"Dev Lab","x":8,"y":0,"w":9,"d":6,"color":"#dab989","label":[12,1]},
+    {"id":"infra","name":"Security / Infra","x":17,"y":0,"w":7,"d":6,"color":"#bfd0b4","label":[20,0.8],"permissionZone":"internal"},
+    {"id":"strategy","name":"Stratégie","x":0,"y":5,"w":8,"d":5,"color":"#e8c890","label":[2,6.2]},
+    {"id":"studio","name":"Studio","x":8,"y":6,"w":9,"d":6,"color":"#d8b499","label":[12,7]},
+    {"id":"finance","name":"Finance","x":17,"y":6,"w":7,"d":4,"color":"#e4cf9a","label":[21,7]},
+    {"id":"library","name":"Bibliothèque","x":0,"y":10,"w":8,"d":6,"color":"#d5b982","label":[3,12]},
+    {"id":"archives","name":"Archives","x":8,"y":12,"w":4,"d":4,"color":"#bdbd9b","label":[10,14]},
+    {"id":"meeting","name":"Réunion","x":12,"y":12,"w":7,"d":4,"color":"#dcca91","label":[16,15]},
+    {"id":"cafe","name":"Café","x":19,"y":10,"w":5,"d":6,"color":"#dfb47f","label":[21.5,15]},
+    {"id":"garden","name":"Terrasse / Jardin","x":24,"y":0,"w":4,"d":16,"color":"#a6b792","label":[26,15]}
+  ],
+  "agents": [
+    {"id":"cto","name":"CTO","title":"Coordination","room":"strategy","x":3.1,"y":8,"color":"#557582","skin":"#9d643b"},
+    {"id":"assa","name":"ASSA","title":"Assistance","room":"strategy","x":6.1,"y":8,"color":"#c78d48","skin":"#bd8254"},
+    {"id":"pm","name":"PM","title":"Organisation","room":"dev","x":10,"y":4,"color":"#e0ac4e","skin":"#875239"},
+    {"id":"dev","name":"DEV","title":"Développement","room":"dev","x":13,"y":4,"color":"#56877a","skin":"#be8150"},
+    {"id":"qa","name":"QA","title":"Vérification","room":"dev","x":16,"y":4,"color":"#aa819f","skin":"#8c5438"},
+    {"id":"security","name":"SECURITY","title":"Sécurité","room":"infra","x":19,"y":4,"color":"#ae6c55","skin":"#c48b5c"},
+    {"id":"ops","name":"OPS","title":"Exploitation","room":"infra","x":22,"y":4,"color":"#7e9862","skin":"#885c3c"},
+    {"id":"designer","name":"DESIGNER","title":"Design & expérience","room":"studio","x":10.8,"y":10,"color":"#ba8b9d","skin":"#c69065"},
+    {"id":"cl-producer","name":"CL-PRODUCER","title":"Production créative","room":"studio","x":15,"y":10,"color":"#c49251","skin":"#8e5b3b"}
+  ],
+  "objects": [
+    {"id":"board","type":"board","x":6.6,"y":3.4,"interaction":"tasks","label":"Tableau mural : toutes les tâches accessibles"},
+    {"id":"reception","type":"reception","x":2.8,"y":3.2},
+    {"type":"plant","x":0.8,"y":0.6},{"type":"plant","x":7.2,"y":0.6},{"type":"plant","x":17.6,"y":0.6},
+    {"type":"plant","x":23.4,"y":5.5},{"type":"plant","x":7.2,"y":9.3},{"type":"plant","x":16.5,"y":11.5},
+    {"type":"plant","x":0.9,"y":15.2},{"type":"plant","x":23,"y":15},
+    {"type":"books","x":1.5,"y":10.9},{"type":"books","x":4.9,"y":10.9},
+    {"type":"armchair","x":2.2,"y":14.4},{"type":"armchair","x":5.4,"y":14.4},
+    {"type":"archives","x":8.7,"y":12.5},{"type":"archives","x":10.5,"y":12.5},
+    {"type":"meeting","x":14.8,"y":13.7},
+    {"type":"coffee","x":21,"y":11},{"type":"cafe-table","x":21.8,"y":13.6},
+    {"type":"finance-desk","x":19.3,"y":8.7},
+    {"type":"sofa","x":2.6,"y":6.5},
+    {"type":"art","x":9,"y":6.5},{"type":"camera","x":16,"y":7.4},
+    {"type":"server","x":23,"y":1.8},
+    {"type":"plant","x":25,"y":1},{"type":"plant","x":27,"y":2},{"type":"plant","x":26,"y":6},
+    {"type":"plant","x":27,"y":9},{"type":"plant","x":25.5,"y":13},{"type":"bench","x":26,"y":11}
+  ],
+  "portals": [],
+  "adapters": {"meetings":"not_connected","socialMemory":"not_connected","messages":"not_connected","assignment":"not_connected"}
+}

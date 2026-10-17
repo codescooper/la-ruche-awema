@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""awema-action — executant unique des actions sous approbation (Control Plane AWEMA).
+
+C'est le point d'application qui manquait (C-02 : « aucun consommateur local
+d'approbation »). Regles :
+
+  * refus par defaut : sans approbation conforme, signee, approuvee, non expiree,
+    non consommee et liee a la meme action + tache + projet, aucune execution ;
+  * aucune approbation approuvee ne reste sans effet : l'effet est ecrit AVANT la
+    consommation, et l'approbation n'est marquee consommee qu'apres succes ;
+  * si le journal (ecrit avant l'effet) ou l'ecriture de l'effet echoue, rien n'est
+    consomme et l'action est refusee ;
+  * l'approbation ne peut pas autoriser une autre action que celle pour laquelle
+    elle a ete demandee, ni une autre tache, ni un autre projet.
+"""
+import argparse
+import json
+import os
+import secrets
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_approval_lib as A  # noqa: E402
+
+ROOT = Path(os.environ.get("AWEMA_CORE_ROOT", "/awema-core"))
+
+
+def ecrire_effet(root, entree):
+    d = Path(root) / "data/effects"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "effects.jsonl"
+    ligne = json.dumps(entree, ensure_ascii=False) + "\n"
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, ligne.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return p
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="awema-action")
+    ap.add_argument("run")
+    ap.add_argument("--approval-id", required=True)
+    ap.add_argument("--task", required=True)
+    ap.add_argument("--project", required=True)
+    ap.add_argument("--action", required=True)
+    ap.add_argument("--actor", required=True)
+    a = ap.parse_args(argv)
+
+    c = A.contract(ROOT)
+
+    # 1) la politique doit toujours exiger une approbation pour cette action
+    if not A.exige_approbation(ROOT, a.action):
+        raise A.Refus(f"action sans approbation requise : {a.action}")
+
+    # 2) pre-verification complete (raison de refus precise, sans effet de bord)
+    with A.verrou(ROOT, "action-" + a.approval_id):
+        obj = A.charger_apr(ROOT, a.approval_id, c)
+        if obj["task"] != a.task:
+            raise A.Refus(f"liaison tache invalide : approbation={obj['task']} execution={a.task}")
+        if obj["project"] != a.project:
+            raise A.Refus(f"liaison projet invalide : approbation={obj['project']} execution={a.project}")
+        if obj["action"] != a.action:
+            raise A.Refus(f"liaison action invalide : approbation={obj['action']} execution={a.action}")
+        if obj["status"] != "approved":
+            raise A.Refus(f"approbation non approuvee ({obj['status']}) : {obj['id']}")
+        if A._now_dt() >= A.parse_ts(obj["expires_at"], "expires_at"):
+            raise A.Refus(f"approbation expiree : {obj['id']}")
+        if obj["policy_digest"] != A.politique_digest(ROOT):
+            raise A.Refus("politique modifiee depuis la decision : execution refusee")
+
+        # 3) journal AVANT mutation (fail-closed)
+        execution_id = "EXE-" + secrets.token_hex(8)
+        A.journal(ROOT, "action_starting", execution=execution_id, approval=obj["id"],
+                  task=a.task, project=a.project, action=a.action, actor=a.actor,
+                  approver=obj["approver"])
+
+        # 4) effet attendu (ici, journal local d'effet ; en production : appel broker)
+        entree = {"execution": execution_id, "approval": obj["id"], "action": a.action,
+                  "task": a.task, "project": a.project, "actor": a.actor,
+                  "approver": obj["approver"], "at": A.now(),
+                  "hostapr_contract": A.HOSTAPR_CONTRACT}
+        try:
+            p = ecrire_effet(ROOT, entree)
+        except OSError as exc:
+            raise A.Refus(f"ecriture de l'effet impossible ({exc}) — approbation non consommee")
+        A.journal(ROOT, "action_executed", execution=execution_id, approval=obj["id"],
+                  task=a.task, project=a.project, action=a.action, actor=a.actor,
+                  effect=str(p), approver=obj["approver"])
+
+    # 5) consommation a usage unique apres succes (mutation tracee dans consommer)
+    A.consommer(ROOT, a.approval_id, a.task, a.project, a.action, a.actor, c)
+    print(f"{execution_id} {obj['id']} {a.action} {a.task} {a.project}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except A.Refus as exc:
+        try:
+            A.journal(ROOT, "approval_refused", tool="awema-action", detail=str(exc))
+        except A.Refus:
+            pass
+        print("REFUS: " + str(exc), file=sys.stderr)
+        sys.exit(64)

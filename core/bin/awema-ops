@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""V3 client: explicit schemas, metadata JSON only; no credential arguments."""
+import argparse,json,re,socket,time
+from pathlib import Path
+SOCKET='/opt/awema-ai/core/data/broker/ops.sock' if Path('/opt/awema-ai/core/data/broker').is_dir() else '/awema-core/data/broker/ops.sock'
+def make_query(verb,task=None,approval=None,target=None,project=None):
+ verb={'deploy-complet':'deploy','reprise':'rollback'}.get(verb,verb)
+ if verb in ['status','versions','artifact-version']:
+  if any(v is not None for v in [task,approval,target,project]):raise ValueError('read takes no mutation fields')
+  return {'verb':verb}
+ if verb not in ['deploy','rollback'] or project!='awema-jury' or not isinstance(task,str) or not re.fullmatch(r'(?:TASK-[A-Za-z0-9-]{1,80}|t_[a-f0-9]{8})',task) or not isinstance(approval,str) or not re.fullmatch(r'HOSTAPR-[A-Za-z0-9-]{1,80}',approval) or not isinstance(target,str) or not re.fullmatch('[a-f0-9]{64}',target):raise ValueError('canonical approval binding required')
+ return {'verb':verb,'task':task,'project':project,'approval_id':approval,'artifact_digest':target}
+def exchange(query,path=SOCKET):
+ deadline=time.monotonic()+200
+ with socket.socket(socket.AF_UNIX) as s:
+  s.settimeout(200);s.connect(path);s.sendall((json.dumps(query)+'\n').encode());raw=b''
+  while b'\n' not in raw:
+   remaining=deadline-time.monotonic()
+   if remaining<=0:raise TimeoutError('broker reply deadline')
+   s.settimeout(remaining);part=s.recv(min(4096,16385-len(raw)))
+   if not part:raise ValueError('incomplete broker reply')
+   raw+=part
+   if len(raw)>16384:raise ValueError('bounded broker reply')
+  value=json.loads(raw.splitlines()[0])
+  return metadata(value)
+def metadata(value):
+ allowed={'ok','error','journalise','retry_allowed','operation','effect_uncertain','rc','gate_enabled','running','images','artifact_digest'}
+ if not isinstance(value,dict) or set(value)-allowed or type(value.get('ok')) is not bool:raise ValueError('closed metadata response')
+ for key in ['journalise','retry_allowed','effect_uncertain','gate_enabled']:
+  if key in value and type(value[key]) is not bool:raise ValueError('metadata bool')
+ if 'error' in value and value['error'] not in ['request_denied','broker_refused','effect_uncertain','broker_response_unavailable']:raise ValueError('closed error')
+ if 'operation' in value and not re.fullmatch('[a-f0-9]{32}',str(value['operation'])):raise ValueError('operation')
+ if 'rc' in value and (type(value['rc']) is not int or not -255<=value['rc']<=255):raise ValueError('rc')
+ if 'artifact_digest' in value and not re.fullmatch('[a-f0-9]{64}',str(value['artifact_digest'])):raise ValueError('digest')
+ for key in ['running','images']:
+  if key in value:
+   if not isinstance(value[key],dict) or set(value[key])!={'office','owner'}:raise ValueError('fixed services')
+   for item in value[key].values():
+    if key=='running' and type(item) is not bool:raise ValueError('running')
+    if key=='images' and not isinstance(item,str):raise ValueError('image')
+    if key=='images' and not re.fullmatch('sha256:[a-f0-9]{64}',item):raise ValueError('image')
+ return value
+def main():
+ p=argparse.ArgumentParser();p.add_argument('verb',choices=['status','versions','artifact-version','deploy','deploy-complet','rollback','reprise']);p.add_argument('--task');p.add_argument('--approval-id');p.add_argument('--artifact-digest');p.add_argument('--project');a=p.parse_args()
+ try:r=exchange(make_query(a.verb,a.task,a.approval_id,a.artifact_digest,a.project))
+ except Exception:r={'ok':False,'error':'broker_response_unavailable','retry_allowed':False}
+ print(json.dumps(r));return 0 if r.get('ok') is True else 1
+if __name__=='__main__':raise SystemExit(main())

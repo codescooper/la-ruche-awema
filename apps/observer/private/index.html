@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>La Ruche · Espace propriétaire</title><link rel="stylesheet" href="/private/style.css"><script defer src="/private/app.js"></script></head>
+<body><main><header><a href="/">La Ruche</a><span>Espace propriétaire</span></header>
+<h1>L’activité de l’équipe</h1><p class="intro">Des observations réelles, en lecture seule. Les dossiers, messages et informations clients restent hors de cette vue.</p>
+<form id="login"><label for="password">Clé d’accès propriétaire</label><input id="password" name="password" type="password" autocomplete="current-password" required minlength="43" maxlength="128"><button>Se connecter</button></form>
+<p id="message" role="status" aria-live="polite"></p>
+<section id="dashboard" hidden><div class="actions"><button id="refresh">Actualiser</button><button id="logout">Se déconnecter</button></div><p id="freshness"></p><p id="sources"></p><p>Les références de tâches sont pseudonymisées. Un rôle inconnu signifie que l’attribution n’a pas été reconnue ; une tâche terminée ne prouve pas un déploiement. La dernière date connue correspond à une création, un démarrage, une fin ou un signal de vie enregistré.</p><div class="table-wrap"><table><thead><tr><th>Tâche</th><th>Tableau</th><th>Rôle assigné</th><th>Statut</th><th>Création</th><th>Dernière date connue</th></tr></thead><tbody id="tasks"></tbody></table></div></section>
+</main></body></html>

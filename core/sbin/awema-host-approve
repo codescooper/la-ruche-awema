@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+import argparse,os,time,secrets,sys,re
+from pathlib import Path
+sys.path.insert(0,'/usr/local/lib/awema-broker')
+from awema_broker_lib import ApprovalStore,snapshot,lock
+def main():
+ if os.getuid()!=0:raise PermissionError('root operator only')
+ p=argparse.ArgumentParser();p.add_argument('--task',required=True);p.add_argument('--digest',required=True);p.add_argument('--verb',choices=['deploy','rollback'],required=True);p.add_argument('--approver',required=True);p.add_argument('--reason',required=True);p.add_argument('--ttl',type=int,default=900);a=p.parse_args()
+ if not re.fullmatch(r'(?:TASK-[A-Za-z0-9-]{1,80}|t_[a-f0-9]{8})',a.task) or not 1<=len(a.approver)<=80 or not 1<=len(a.reason)<=1000:raise ValueError('bounded human approval metadata')
+ root=Path('/opt/awema-ops/broker')
+ with lock(root/'transaction.lock'):
+  snapshot(root,a.digest,root/'template/compose.json');aid='HOSTAPR-'+secrets.token_hex(16)
+  # Root CLI issuance is auditable; no pending record permits execution.
+  sys.path.insert(0,'/opt/awema-ai/core/bin');import awema_audit_lib as audit
+  token=Path('/etc/awema/v2/tokens/broker-service.token').read_text();correlation=secrets.token_hex(16)
+  def journal(event):audit.emettre('/opt/awema-ai/core',event,tool='awema-host-approve',target='snapshot:'+a.digest,correlation_id=correlation,acteur='broker-service',token=token,task=('TASK-NATIVE-'+a.task[2:]) if a.task.startswith('t_') else a.task,project='awema-jury',detail={'verb':a.verb,'artifact_digest':a.digest,'approval_id':aid})
+  d={'id':aid,'task':a.task,'project':'awema-jury','action':'production_deploy' if a.verb=='deploy' else 'production_rollback','verb':a.verb,'artifact_digest':a.digest,'status':'pending','approver':a.approver,'reason':a.reason,'expires_at_epoch':time.time()+max(60,min(3600,a.ttl)),'reserved_at':None,'consumed_at':None}
+  store=ApprovalStore(root/'approvals');journal('broker_approval_intent');store.create(d);journal('broker_approval_confirmed')
+  with lock(store._p(aid).with_suffix('.lock')):d['status']='approved';store._write(store._p(aid),d)
+ print(aid)
+if __name__=='__main__':main()

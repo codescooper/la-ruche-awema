@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""awema-audit — lecture, verification et export du journal d'audit (P0-3).
+
+Sous-commandes :
+  verify [--coherence]   rejoue le controle d'integrite (chaine, signature, champs,
+                         horodatage, identites) et la detection d'ecritures directes
+  tail [-n N]            affiche les N dernieres entrees brutes
+  samples [-n N]         extrait lisible (preuve d'exploitabilite)
+  coverage [--json]      couverture statique : journal avant mutation, acces directs
+  export --to CHEMIN     export scelle (copie + manifeste sha256) apres verification
+  keygen --path CHEMIN   genere une cle d'audit hors du journal (0600)
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_audit_lib as AUD  # noqa: E402
+
+ROOT = AUD.racine()
+
+
+def _verifier(root, coherence=False):
+    rap = AUD.verifier_journal(root)
+    if coherence:
+        rap["ecritures_directes"] = AUD.detecter_ecritures_directes(root)
+        if rap["ecritures_directes"]:
+            rap["verdict"] = "ecart"
+    return rap
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="awema-audit")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    v = sp.add_parser("verify")
+    v.add_argument("--coherence", action="store_true")
+    v.add_argument("--json", action="store_true")
+    t = sp.add_parser("tail")
+    t.add_argument("-n", type=int, default=10)
+    s = sp.add_parser("samples")
+    s.add_argument("-n", type=int, default=3)
+    s.add_argument("--out", default=None)
+    c = sp.add_parser("coverage")
+    c.add_argument("--json", action="store_true")
+    e = sp.add_parser("export")
+    e.add_argument("--to", required=True)
+    k = sp.add_parser("keygen")
+    k.add_argument("--path", required=True)
+    a = ap.parse_args(argv)
+
+    if a.cmd == "keygen":
+        print(str(AUD.nouveau_cle_audit(a.path)))
+        return 0
+
+    if a.cmd == "verify":
+        rap = _verifier(ROOT, a.coherence)
+        if a.json:
+            print(json.dumps(rap, ensure_ascii=False, indent=2))
+        else:
+            print(f"journal      : {rap['fichier']}")
+            print(f"existe       : {rap['existe']}  octets={rap['octets']}  sha256={rap['sha256']}")
+            print(f"entrees      : {rap['entrees']}  seq_max={rap['dernier_seq']}")
+            print(f"chaine       : {'intacte' if rap['chaine_intacte'] else 'ROMPUE'}  "
+                  f"signature={'valide' if rap['signature_valide'] else 'INVALIDE'}")
+            print(f"periode      : {rap['ts_min']} -> {rap['ts_max']}")
+            print(f"acteurs      : {json.dumps(rap['acteurs'], ensure_ascii=False)}")
+            print(f"evenements   : {json.dumps(rap['evenements'], ensure_ascii=False)}")
+            for e_ in rap["ecarts"]:
+                print(f"ECART ligne {e_['ligne']}: {e_['motif']}")
+            for e_ in rap.get("ecritures_directes", []):
+                print(f"ECART ecriture directe: {e_['fichier']} — {e_['motif']}")
+            print("VERDICT:", rap["verdict"])
+        return 0 if rap["verdict"] == "conforme" else 1
+
+    if a.cmd == "tail":
+        entrees = [e for e in AUD.lire_journal(ROOT) if isinstance(e, dict)][-a.n:]
+        for e in entrees:
+            print(json.dumps(e, ensure_ascii=False))
+        return 0
+
+    if a.cmd == "samples":
+        entrees = [e for e in AUD.lire_journal(ROOT) if isinstance(e, dict)][-a.n:]
+        texte = "\n".join(json.dumps(e, ensure_ascii=False, indent=2) for e in entrees) + "\n"
+        if a.out:
+            p = Path(a.out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(texte, encoding="utf-8")
+            os.chmod(p, 0o600)
+            print(str(p))
+        else:
+            print(texte, end="")
+        return 0
+
+    if a.cmd == "coverage":
+        rap = AUD.couverture_statique(Path(__file__).resolve().parent)
+        if a.json:
+            print(json.dumps(rap, ensure_ascii=False, indent=2))
+        else:
+            print(f"repertoire   : {rap['repertoire']}")
+            for nom, d in sorted(rap["fichiers"].items()):
+                if "exempt" in d:
+                    print(f"  {nom:24s} exempt ({d['exempt']})")
+                    continue
+                etat = "journal AVANT mutation" if d.get("journal_avant_mutation") else "A VERIFIER"
+                print(f"  {nom:24s} {etat}  fonctions={len(d.get('fonctions', []))}")
+            for v in rap["violations"]:
+                print(f"VIOLATION {v['fichier']}::{v['fonction']} — {v['motif']} "
+                      f"(emit={v['emit']} mutation={v['mutation']})")
+            for f in rap["acces_direct_journal"]:
+                print(f"ACCES DIRECT au journal : {f}")
+            print("VERDICT:", rap["verdict"])
+        return 0 if rap["verdict"] == "conforme" else 1
+
+    if a.cmd == "export":
+        rap = _verifier(ROOT)
+        if rap["verdict"] != "conforme":
+            print("REFUS: export refuse, journal non conforme : " + rap["ecarts"][0]["motif"], file=sys.stderr)
+            return 1
+        cible = Path(a.to)
+        cible.mkdir(parents=True, exist_ok=True)
+        j = cible / "events.jsonl"
+        shutil.copyfile(AUD.journal_path(ROOT), j)
+        os.chmod(j, 0o400)
+        manifeste = {"schema": AUD.SCHEMA, "exporte_le": AUD.maintenant(),
+                     "source": str(AUD.journal_path(ROOT)),
+                     "sha256_journal": hashlib.sha256(j.read_bytes()).hexdigest(),
+                     "entrees": rap["entrees"], "seq_max": rap["dernier_seq"],
+                     "dernier_hash": rap["dernier_hash"], "verdict_source": rap["verdict"]}
+        m = cible / "MANIFESTE.json"
+        m.write_text(json.dumps(manifeste, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        copie = AUD.verifier_journal(ROOT, entrees=[json.loads(l) for l in
+                                                    j.read_text(encoding="utf-8").splitlines() if l.strip()])
+        manifeste["verdict_copie"] = copie["verdict"]
+        m.write_text(json.dumps(manifeste, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(m, 0o400)
+        print(json.dumps(manifeste, ensure_ascii=False, indent=2))
+        return 0 if copie["verdict"] == "conforme" else 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except AUD.AuditRefus as exc:
+        print("REFUS: " + str(exc), file=sys.stderr)
+        sys.exit(64)
+    except AUD.AuditIndisponible as exc:
+        print("REFUS: " + str(exc), file=sys.stderr)
+        sys.exit(65)

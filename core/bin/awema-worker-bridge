@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Real local process for native Hermes PID/lifecycle tracking."""
+import os,json,socket,time,signal,sys
+q=json.loads(os.environ['AWEMA_WORKER_REQUEST']);cancel=False
+def signal_handler(*args):
+ global cancel
+ cancel=True
+for sig in [signal.SIGTERM,signal.SIGINT]:signal.signal(sig,signal_handler)
+def rpc(operation):
+ payload=dict(q,op=operation);s=socket.socket(socket.AF_UNIX);s.settimeout(15)
+ try:
+  s.connect('/awema-broker/workers.sock');s.sendall((json.dumps(payload)+'\n').encode());raw=b''
+  while b'\n' not in raw:
+   part=s.recv(65536)
+   if not part:break
+   raw+=part
+   if len(raw)>65536:raise RuntimeError('response bound exceeded')
+  response=json.loads(raw.splitlines()[0])
+  if not response.get('ok'):raise RuntimeError('restricted launcher refused operation')
+  return response['state']
+ finally:s.close()
+started=time.monotonic()
+try:
+ state=rpc('launch')
+ seconds=state.get('budget',{}).get('seconds',900)
+ if type(seconds)is not int or not 300<=seconds<=900:raise RuntimeError('worker budget invalid')
+ print(json.dumps({'event':'restricted_worker_started','operation':state['operation'],'task':q['task'],'run':q['run']}),flush=True)
+ while state['status'] not in ['finished','failed']:
+  if cancel or time.monotonic()-started>seconds+180:state=rpc('cancel')
+  else:state=rpc('status')
+  time.sleep(1)
+ print(json.dumps({'event':'restricted_worker_finished','operation':state['operation'],'outcome':state.get('outcome'),'status':state['status']}),flush=True)
+ sys.exit(0 if state['status']=='finished' else 1)
+except Exception as exc:
+ try:rpc('cancel')
+ except Exception:pass
+ print(json.dumps({'event':'restricted_worker_bridge_failed','error':type(exc).__name__}),flush=True);sys.exit(1)

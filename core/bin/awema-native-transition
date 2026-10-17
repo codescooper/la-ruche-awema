@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Atomic task version + claim CAS using Hermes' native lifecycle APIs."""
+import sys,json,hashlib,time
+from contextlib import contextmanager
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+q=json.load(sys.stdin)
+if set(q)-{'task','run','claim','digest','operation','summary','metadata','requires'} or q['operation'] not in ['complete','block']:raise RuntimeError('transition request denied')
+conn=kbc.connect()
+original_txn=kb.write_txn
+guard_completed=False
+@contextmanager
+def guarded_txn(conn,**kwargs):
+ global guard_completed
+ with original_txn(conn,**kwargs):
+  if not guard_completed:
+   row=conn.execute('select * from tasks where id=?',(q['task'],)).fetchone()
+   if not row or row['status']!='running' or row['claim_lock']!=q['claim'] or row['current_run_id']!=q['run'] or row['claim_expires']<time.time():raise RuntimeError('native claim CAS denied')
+   digest=hashlib.sha256(json.dumps({k:row[k] for k in ['id','title','body','assignee','project_id','skills','model_override','provider_override','completion_contract']},sort_keys=True).encode()).hexdigest()
+   if digest!=q['digest']:raise RuntimeError('native task version CAS denied')
+   for task in q.get('requires',[]):
+    parent=conn.execute('select status from tasks where id=?',(task,)).fetchone()
+    if not parent or parent['status']!='done':raise RuntimeError('native prerequisite CAS denied')
+  yield conn
+  current=conn.execute('select status from tasks where id=?',(q['task'],)).fetchone()
+  if current and current['status'] in ['done','blocked','triage']:guard_completed=True
+kb.write_txn=guarded_txn
+# Worker hooks are not allowed to send messages or execute extra processes.
+kb._fire_task_hook=lambda *args,**kwargs:None
+if q['operation']=='complete':
+ ok=kb.complete_task(conn,q['task'],result=q['summary'],summary=q['summary'],metadata=q.get('metadata'),expected_run_id=q['run'],force=False,fire_lifecycle_hook=False)
+else:ok=kb.block_task(conn,q['task'],reason=q['summary'],kind='capability',expected_run_id=q['run'])
+if not ok:raise RuntimeError('native transition refused')
+print(json.dumps({'task':q['task'],'run':q['run'],'transition':q['operation'],'ok':True}))

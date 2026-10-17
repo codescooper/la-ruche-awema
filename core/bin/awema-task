@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""awema-task — taches du Control Plane AWEMA (copie CP-01 + durcissement P0-3).
+
+Delta vs la version de la carte t_d151fb18 (journal deja ecrit avant mutation) :
+  * le chemin de COMPENSATION ecrivait l'approbation liberee puis journalisait :
+    l'ordre est inverse (entree d'audit AVANT la remise a `approved`) ;
+  * l'ecriture du fichier de tache est durable (fsync fichier + repertoire) ;
+  * `AWEMA_REGISTRY_FILE` permet de pointer le registre projects.yaml dans la
+    copie isolee (le chemin code en dur reste le defaut ; C-21 reste ouvert,
+    carte t_b2702b07).
+"""
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_approval_lib as A  # noqa: E402
+
+ROOT = Path(os.environ.get("AWEMA_CORE_ROOT", "/awema-core"))
+TASKS = ROOT / "data/tasks"
+PROJECTS = Path(os.environ.get("AWEMA_REGISTRY_FILE") or "/opt/awema-ai/registry/projects.yaml")
+STATES = {"backlog", "todo", "in_progress", "ai_review", "human_review", "blocked", "done"}
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def project_known(name):
+    if not PROJECTS.exists():
+        return False
+    return ("\n  " + name + ":\n") in PROJECTS.read_text(encoding="utf-8")
+
+
+def load(tid):
+    p = TASKS / (tid + ".json")
+    if not p.exists():
+        raise A.Refus("tache introuvable: " + tid)
+    return p, json.loads(p.read_text(encoding="utf-8"))
+
+
+def save(p, d):
+    tmp = p.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(d, ensure_ascii=False, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    try:
+        dfd = os.open(p.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def approbation_requise(tache):
+    v = tache.get("validation") or {}
+    return bool(v.get("required"))
+
+
+def approbateur_attendu(tache):
+    v = tache.get("validation") or {}
+    return str(v.get("approver") or "").strip()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="awema-task")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sp.add_parser("create")
+    c.add_argument("--title", required=True)
+    c.add_argument("--project", required=True)
+    c.add_argument("--objective", required=True)
+    c.add_argument("--assignee", default="coordinator")
+    c.add_argument("--created-by", default="human")
+    c.add_argument("--priority", default="normal")
+
+    sp.add_parser("list")
+    s = sp.add_parser("show")
+    s.add_argument("id")
+    m = sp.add_parser("move")
+    m.add_argument("id")
+    m.add_argument("status", choices=sorted(STATES))
+    m.add_argument("--actor", default="human")
+    m.add_argument("--approval-id", default=None)
+
+    a = ap.parse_args(argv)
+    TASKS.mkdir(parents=True, exist_ok=True)
+
+    if a.cmd == "create":
+        if not project_known(a.project):
+            raise A.Refus("projet absent du registre: " + a.project)
+        tid = "TASK-" + datetime.now(timezone.utc).strftime("%Y%m%d") + "-" + uuid.uuid4().hex[:6].upper()
+        d = {"id": tid, "title": a.title, "project": a.project, "objective": a.objective,
+             "context": "", "inputs": [], "status": "backlog", "priority": a.priority,
+             "created_at": now(), "created_by": a.created_by, "assignee_type": "agent",
+             "assignee": a.assignee,
+             "permissions": {"level": "autonomous", "allowed": [],
+                             "denied": ["production_mutation", "arbitrary_root",
+                                        "docker_socket", "secret_dump"]},
+             "completion_criteria": [], "deliverables": [],
+             "validation": {"required": False, "approver": ""},
+             "dependencies": [], "notes": []}
+        A.journal(ROOT, "task_created", task=tid, project=a.project, actor=a.created_by)
+        save(TASKS / (tid + ".json"), d)
+        print(tid)
+        return 0
+
+    if a.cmd == "list":
+        for p in sorted(TASKS.glob("TASK-*.json")):
+            d = json.loads(p.read_text(encoding="utf-8"))
+            print(f'{d["id"]}\t{d["status"]}\t{d["project"]}\t{d["assignee"]}\t{d["title"]}')
+        return 0
+
+    if a.cmd == "show":
+        _, d = load(a.id)
+        print(json.dumps(d, ensure_ascii=False, indent=2))
+        return 0
+
+    if a.cmd == "move":
+        p, d = load(a.id)
+        old = d.get("status")
+        besoin = approbation_requise(d)
+
+        if old == a.status:
+            raise A.Refus(f"transition sans effet : deja {a.status}")
+        A.journal(ROOT, "task_move_starting", task=a.id, **{"from": old, "to": a.status},
+                  actor=a.actor, approval=a.approval_id)
+
+        if a.status == "done" and besoin:
+            if not a.approval_id:
+                raise A.Refus(
+                    "validation requise : --approval-id obligatoire pour passer a done")
+            consommateur = a.approval_id
+        else:
+            consommateur = None
+            if a.approval_id and a.status != "done":
+                raise A.Refus("approbation fournie pour une transition qui n'en exige pas")
+
+        apr = None
+        if consommateur:
+            attendu = approbateur_attendu(d)
+            apr = A.charger_apr(ROOT, consommateur)
+            if apr["task"] != a.id:
+                raise A.Refus("liaison tache invalide : approbation pour " + apr["task"])
+            if apr["project"] != d.get("project"):
+                raise A.Refus("liaison projet invalide : approbation pour " + apr["project"])
+            if attendu and apr["approver"] != attendu:
+                raise A.Refus(
+                    f"approbateur non conforme : attendu {attendu}, obtenu {apr['approver']}")
+            A.consommer(ROOT, consommateur, a.id, d.get("project"), apr["action"], a.actor)
+
+        d["status"] = a.status
+        d["updated_at"] = now()
+        try:
+            save(p, d)
+        except OSError as exc:
+            # compensation : une approbation consommee sans transition ne doit pas rester consommee.
+            # L'entree d'audit precede la remise a `approved` (P0-3 : journal avant mutation).
+            if apr is not None:
+                A.journal(ROOT, "approval_released", approval=apr["id"], task=a.id,
+                          actor=a.actor, motif="echec d'ecriture de la tache")
+                apr["status"] = "approved"
+                apr["consumed_at"] = None
+                apr["consumed_by"] = None
+                A.ecrire_apr(ROOT, apr, A.cle())
+            raise A.Refus(f"ecriture de la tache impossible ({exc}) — mutation annulee")
+
+        A.journal(ROOT, "task_moved", task=a.id, **{"from": old, "to": a.status},
+                  actor=a.actor, approval=consommateur)
+        print(f"{a.id}: {old} -> {a.status}")
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except A.Refus as exc:
+        try:
+            A.journal(ROOT, "approval_refused", tool="awema-task", detail=str(exc))
+        except A.Refus:
+            pass
+        print("REFUS: " + str(exc), file=sys.stderr)
+        sys.exit(64)

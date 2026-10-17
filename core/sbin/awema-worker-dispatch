@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Root-only targeted native dispatch; grant before claim, never whole queue."""
+import os,sys,re,json,time,subprocess,secrets,stat,hashlib,importlib.machinery,importlib.util
+from pathlib import Path
+if os.getuid()!=0 or len(sys.argv)!=2 or not re.fullmatch('t_[a-f0-9]{8}',sys.argv[1]):raise SystemExit('root operator + exact task required')
+task=sys.argv[1];loader=importlib.machinery.SourceFileLoader('launcher','/usr/local/lib/awema-worker-launcher/awema-worker-launcher');spec=importlib.util.spec_from_loader(loader.name,loader);m=importlib.util.module_from_spec(spec);loader.exec_module(m)
+def verified_registry(role,authorization,action):
+ registry=m.BASE/'registry/execution-v2.json'
+ if registry.parent.is_symlink() or registry.is_symlink():raise ValueError('registry symlink denied')
+ expected_uid=os.geteuid();parent=registry.parent.stat()
+ if parent.st_uid!=expected_uid or parent.st_mode&0o022:raise ValueError('registry parent trust denied')
+ fd=os.open(registry,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ with os.fdopen(fd,'rb') as source:
+  info=os.fstat(source.fileno())
+  if not stat.S_ISREG(info.st_mode) or info.st_uid!=expected_uid or info.st_mode&0o022 or info.st_size>131072:raise ValueError('registry trust boundary denied')
+  data=source.read(131073)
+ if len(data)>131072:raise ValueError('registry size denied')
+ policy=json.loads(data);digest=hashlib.sha256(data).hexdigest()
+ if policy.get('version')!=2 or policy.get('board')!='awema-agency' or policy.get('project')!='awema-ai-team' or policy.get('sensitive_actions_enabled') is not False:raise ValueError('registry scope denied')
+ selected=policy.get('roles',{}).get(role)
+ if not selected or selected.get('enabled') is not True or selected.get('uid')!=m.UIDS.get(role) or selected.get('route')!='native-isolated' or selected.get('toolsets')!=['terminal','file'] or action not in selected.get('actions',[]) or selected.get('projects')!=['awema-ai-team']:raise ValueError('registry permission or route denied')
+ if authorization.get('registry_sha256')!=digest:raise ValueError('registry version mismatch')
+ return selected
+row=m.row(task);grant=json.loads((m.ROOT/'tasks'/(task+'.json')).read_bytes())
+if not row or row['status']!='ready' or grant.get('confirmed') is not True or grant.get('expires',0)<time.time() or grant.get('consumed_run') is not None or grant.get('digest')!=m.digest(row) or grant.get('role')!=row['assignee'] or grant.get('project')!='awema-ai-team' or row.get('project_id') not in [None,'awema-ai-team']:raise RuntimeError('root grant or native task refused before claim; promote exact target first')
+role=row['assignee'];verified_registry(role,grant,'launch')
+for parent in grant.get('requires',[]):
+ r=m.row(parent)
+ if not r or r['status']!='done':raise RuntimeError('prerequisite refused before claim')
+if row.get('goal_mode') or row.get('model_override') or row.get('provider_override') or json.loads(row.get('skills') or '[]'):raise RuntimeError('runtime override refused')
+correlation=secrets.token_hex(16)
+def audit(event,detail):m.AUD.emettre(m.BASE/'core',event,tool='awema-worker-dispatch',target='kanban:'+task,correlation_id=correlation,acteur='worker-launcher',token=Path('/etc/awema/v2/tokens/worker-launcher.token').read_text(),task='TASK-NATIVE-'+task[2:],project='awema-ai-team',detail=detail)
+code="""import json
+from hermes_cli import kanban_db_dispatch as d,kanban_db_connect as kbc
+original=d._lane_rows
+d._lane_rows=lambda c,s:[r for r in original(c,s) if r['id']==TASK]
+d._dispatch_profile_allowlist=lambda normalizer:frozenset([ROLE])
+d._run_reclaim_phase=lambda *args,**kwargs:None
+d._kb._fire_worker_spawned_hook=lambda *args,**kwargs:None
+d._kb._fire_dispatch_tick_hook=lambda *args,**kwargs:None
+d._kb._fire_task_hook=lambda *args,**kwargs:None
+d.review_dispatch_enabled=lambda:False
+r=d.dispatch_once(kbc.connect(),max_spawn=1,max_in_progress=1,max_in_progress_per_profile=1,failure_limit=1,board='awema-agency')
+print(json.dumps({'spawned':[list(x) for x in r.spawned],'skipped_locked':r.skipped_locked}))
+""".replace('TASK',repr(task)).replace('ROLE',repr(role))
+audit('targeted_dispatch_intent',{'role':role,'operator_uid':0})
+try:
+ p=subprocess.run(['docker','exec','-u','10000:10000','-e','HERMES_HOME=/opt/data/profiles/cto','-e','HERMES_PROFILE=cto','-e','HERMES_KANBAN_BOARD=awema-agency','awema-ai-team','/opt/hermes/.venv/bin/python3','-c',code],capture_output=True,text=True,timeout=35)
+ if p.returncode:raise RuntimeError('native dispatcher refused')
+ result=json.loads(p.stdout)
+ if set(result)!={'spawned','skipped_locked'} or any(x[:2]!=[task,role] for x in result['spawned']) or len(result['spawned'])>1:raise RuntimeError('targeted dispatcher metadata')
+ audit('targeted_dispatch_confirmed',{'role':role,'bridge_spawned':len(result['spawned']),'skipped_locked':result['skipped_locked']});print(json.dumps({'task':task,'role':role,'bridge_spawned':len(result['spawned']),'worker_confirmed':False,'journalise':True}))
+except Exception:
+ try:audit('targeted_dispatch_uncertain',{'role':role,'retry_allowed':False})
+ except Exception:pass
+ raise RuntimeError('dispatch uncertain/refused; inspect saved native operation before retry') from None

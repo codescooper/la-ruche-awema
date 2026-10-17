@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""awema-vaultd — service du coffre de secrets par profil (correction P0-4 / CP-03).
+
+C'est le SEUL composant qui ouvre un fichier de secret. Il :
+
+  1. n'accepte que des connexions dont l'UID noyau (SO_PEERCRED) correspond a
+     l'UID attendu du profil dans la politique — c'est le cloisonnement OS ;
+  2. authentifie l'acteur par jeton (registre d'acteurs CP-02) et refuse toute
+     divergence entre l'acteur authentifie et le profil declare (usurpation) ;
+  3. applique la decision du coeur (`awema_secret_lib.autoriser`) : refus par
+     defaut, portee privee non partageable, habilitation valide pour les
+     consommateurs, break-glass humain avec approbation CP-01 a usage unique
+     liee a la cible ;
+  4. journalise AVANT de rendre la valeur (contrat CP-02) ; si le journal est
+     indisponible, rien n'est servi (fail-closed) ;
+  5. ne renvoie que la valeur demandee, encodee en base64, sans jamais ecrire
+     la valeur dans un journal, une erreur ou un fichier.
+
+Options internes de test : AWEMA_VAULT_FAULT=audit (journal indisponible),
+AWEMA_VAULT_FAULT=read (lecture du magasin en echec).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import signal
+import socket
+import stat
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_audit_lib as AUD  # noqa: E402
+import awema_secret_lib as V  # noqa: E402
+
+STOP = {"demande": False}
+ETAT = {}
+
+
+def now_iso():
+    return V.maintenant()
+
+
+def chemin_socket(root) -> Path:
+    return Path(os.environ.get("AWEMA_VAULT_SOCKET") or (Path(root) / "data/vault/vault.sock"))
+
+
+def token_service():
+    return os.environ.get("AWEMA_VAULTD_TOKEN")
+
+
+def acteur_service():
+    return os.environ.get("AWEMA_VAULTD_ACTOR") or "vaultd"
+
+
+def journaliser(root, event, *, target, acteur, kind, token=None, credential=None,
+                correlation_id=None, detail=None, action=None, task=None, project=None):
+    """Ecrit l'entree d'audit AVANT l'effet. Leve si le journal n'accuse pas reception.
+
+    `acteur` doit correspondre au jeton presente : le service d'audit re-verifie
+    l'identite et refuse toute divergence.
+    """
+    if os.environ.get("AWEMA_VAULT_FAULT") == "audit":
+        raise V.SecretIndisponible("panne de journal simulee (injection de defaut)")
+    tok = token if token is not None else token_service()
+    if tok is None:
+        raise V.SecretIndisponible("coffre sans jeton de service : journalisation impossible")
+    return AUD.emettre(root, event, tool="awema-vaultd", target=target,
+                       correlation_id=correlation_id or "vault",
+                       acteur=acteur, token=tok, credential=credential,
+                       action=action, task=task, project=project, detail=detail or {})
+
+
+def refuser(root, motif, charge, meta, acteur=None, kind="agent"):
+    """Refus journalise sous l'identite de service (client non encore authentifie)."""
+    det = {"motif": motif[:400], "peer_uid": meta.get("uid"),
+           "profil_declare": charge.get("profile"), "operation": charge.get("op")}
+    cible = "vault:" + str(charge.get("secret") or "?")
+    corr = charge.get("correlation_id") or "vault"
+    journalise = False
+    try:
+        journaliser(root, "secret_access_denied", target=cible,
+                    acteur=acteur or acteur_service(), kind=kind,
+                    correlation_id=corr, detail=det)
+        journalise = True
+    except (V.SecretRefus, V.SecretIndisponible, AUD.AuditRefus, AUD.AuditIndisponible, OSError):
+        journalise = False
+    return {"ok": False, "error": motif, "refus": True, "journalise": journalise}
+
+
+def decider_et_journaliser(root, charge, acteur, kind):
+    """Decision + journalisation avant tout acces a la valeur."""
+    corr = charge.get("correlation_id") or "vault"
+    cible = "vault:" + str(charge.get("secret"))
+    tok = charge.get("actor_token")
+    cred = charge.get("actor_credential")
+    try:
+        d = V.autoriser(root, charge["secret"], acteur, kind, action="read",
+                        approval_id=charge.get("approval_id"),
+                        tache_secret=charge.get("secret"), token=tok, credential=cred)
+    except (V.SecretRefus, V.SecretIndisponible) as exc:
+        d = {"autorise": False, "motif": str(exc), "base": "magasin_refuse", "details": {}}
+    if not d["autorise"]:
+        journaliser(root, "secret_access_denied", target=cible, acteur=acteur, kind=kind,
+                    token=tok, credential=cred, correlation_id=corr, action="read",
+                    detail={"motif": d["motif"][:400], "base": d["base"],
+                            "profil": charge.get("profile")})
+        return d
+    entree = journaliser(root, "secret_access_granted", target=cible, acteur=acteur, kind=kind,
+                         token=tok, credential=cred, correlation_id=corr, action="read",
+                         detail={"base": d["base"], "motif": d["motif"][:200],
+                                 "version": d["details"].get("version"),
+                                 "profil": charge.get("profile"),
+                                 "ordre": "audit_avant_lecture"})
+    d = dict(d)
+    d["audit_entry"] = (entree or {}).get("id")
+    return d
+
+
+def servir_get(root, charge, meta, acteur, kind):
+    d = decider_et_journaliser(root, charge, acteur, kind)
+    if not d["autorise"]:
+        return {"ok": False, "error": d["motif"], "refus": True, "journalise": True,
+                "audit_entry": d.get("audit_entry")}
+    if os.environ.get("AWEMA_VAULT_FAULT") == "read":
+        raise V.SecretIndisponible("panne de lecture du magasin simulee (injection de defaut)")
+    valeur, idx = V.lire_valeur(root, charge["secret"], charge.get("version"))
+    return {"ok": True, "secret": charge["secret"], "version": V.version_demandee(idx, charge.get("version"))["n"],
+            "fingerprint": V.version_demandee(idx, charge.get("version"))["fingerprint"],
+            "valeur_b64": base64.b64encode(valeur).decode("ascii"),
+            "audit_entry": d.get("audit_entry")}
+
+
+def servir_ecriture(root, charge, meta, acteur, kind):
+    """Provisionnement : ecriture, rotation, revocation, habilitations."""
+    op = charge["op"]
+    corr = charge.get("correlation_id") or "vault"
+    secret_id = charge.get("secret")
+    cible = "vault:" + str(secret_id)
+    tok = charge.get("actor_token")
+    cred = charge.get("actor_credential")
+    evenement = {"put": "secret_placed", "rotate": "secret_rotated", "revoke": "secret_revoked",
+                 "grant": "secret_granted", "revoke_grant": "secret_grant_revoked"}[op]
+    intention = evenement + "_intent"
+    journaliser(root, intention, target=cible, acteur=acteur, kind=kind, token=tok,
+                credential=cred, correlation_id=corr, action=op,
+                detail={"version": charge.get("version"), "profil": charge.get("profile"),
+                        "to": charge.get("to")})
+    if op in ("put", "rotate"):
+        brut = base64.b64decode(charge.get("valeur_b64") or "", validate=True)
+        r = V.provisionner(root, secret_id, brut, acteur, kind, rotation=(op == "rotate"))
+        journaliser(root, evenement, target=cible, acteur=acteur, kind=kind, token=tok, credential=cred, correlation_id=corr, action=op, detail={"phase": "confirmed"})
+        return {"ok": True, **r, "audit": True}
+    if op == "revoke":
+        r = V.revoquer_version(root, secret_id, int(charge.get("version")), acteur, kind)
+        journaliser(root, evenement, target=cible, acteur=acteur, kind=kind, token=tok, credential=cred, correlation_id=corr, action=op, detail={"phase": "confirmed"})
+        return {"ok": True, **r, "audit": True}
+    if op == "grant":
+        g = V.grant_creer(root, secret_id, charge.get("to"), acteur, kind,
+                          int(charge.get("ttl_seconds") or 3600))
+        journaliser(root, evenement, target=cible, acteur=acteur, kind=kind, token=tok, credential=cred, correlation_id=corr, action=op, detail={"phase": "confirmed"})
+        return {"ok": True, "grant": g, "audit": True}
+    if op == "revoke_grant":
+        r = V.grant_revoquer(root, secret_id, charge.get("to"), acteur, kind)
+        journaliser(root, evenement, target=cible, acteur=acteur, kind=kind, token=tok, credential=cred, correlation_id=corr, action=op, detail={"phase": "confirmed"})
+        return {"ok": True, **r, "audit": True}
+    raise V.SecretRefus(f"operation inconnue : {op!r}")
+
+
+def traiter(conn, root):
+    brut = b""
+    conn.settimeout(10.0)
+    while b"\n" not in brut:
+        bloc = conn.recv(65536)
+        if not bloc:
+            break
+        brut += bloc
+        if len(brut) > 131072:
+            return {"ok": False, "error": "requete trop volumineuse", "refus": True}
+    if not brut.strip():
+        return {"ok": False, "error": "requete vide"}
+    try:
+        charge = json.loads(brut.decode("utf-8").splitlines()[0])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"ok": False, "error": "requete illisible"}
+    if not isinstance(charge, dict):
+        return {"ok": False, "error": "requete non objet"}
+    op = charge.get("op")
+    meta = AUD.pid_et_uid_client(conn)
+    try:
+        pol = V.politique(root)
+    except V.SecretIndisponible as exc:
+        return {"ok": False, "error": str(exc)}
+
+    if op in ("ping", "status"):
+        return {"ok": True, "service": "awema-vaultd", "pid": os.getpid(),
+                "uid": os.getuid(), "rules": pol["rules"],
+                "erreur_explicite": {"status": "lecture seule, aucune valeur servie"}}
+
+    profil_declare = charge.get("profile")
+    if not isinstance(profil_declare, str) or not profil_declare:
+        return refuser(root, "profil declare obligatoire (le coffre refuse l'anonymat)",
+                       charge, meta)
+
+    # 1) cloisonnement OS : l'UID noyau du client doit etre l'UID attendu du profil
+    if pol["rules"].get("require_uid_match", True):
+        try:
+            if profil_declare in pol.get("humans", {}):
+                attendu = pol["humans"][profil_declare].get("uid")
+                if not isinstance(attendu, int):
+                    raise V.SecretRefus("UID humain explicite obligatoire")
+            else:
+                attendu = V.profil(pol, profil_declare)["uid"]
+        except V.SecretRefus as exc:
+            return refuser(root, str(exc), charge, meta)
+        if int(meta["uid"]) != int(attendu):
+            return refuser(
+                root,
+                f"cloisonnement OS : uid noyau {meta['uid']} != uid attendu {attendu} "
+                f"pour le profil {profil_declare} (refus)",
+                charge, meta)
+    if pol["rules"].get("require_vault_uid", True):
+        # le service lui-meme doit tourner sous l'UID du coffre
+        if os.getuid() != V.uid_coffre(pol):
+            return {"ok": False, "error": "service hors de l'UID du coffre (refus)", "refus": True}
+
+    # 2) authentification de l'acteur
+    try:
+        acteur, kind = AUD.authentifier(root, charge.get("actor_token"),
+                                        charge.get("profile"), charge.get("actor_credential"))
+    except AUD.AuditIdentityMismatch as exc:
+        try:
+            journaliser(root, "secret_identity_mismatch", target="vault:" + str(charge.get("secret") or "?"),
+                        acteur=exc.actor, kind=exc.kind or "agent",
+                        token=charge.get("actor_token"), credential=charge.get("actor_credential"),
+                        correlation_id=charge.get("correlation_id") or "vault",
+                        detail={"motif": str(exc)[:400], "profil_declare": profil_declare})
+        except (V.SecretRefus, V.SecretIndisponible, AUD.AuditRefus, AUD.AuditIndisponible, OSError):
+            pass
+        return {"ok": False, "error": str(exc), "refus": True, "usurpation": True}
+    except AUD.AuditRefus as exc:
+        return {"ok": False, "error": str(exc), "refus": True}
+    except AUD.AuditIndisponible as exc:
+        return {"ok": False, "error": str(exc), "refus": True, "indisponible": True}
+
+    if kind == "agent" and acteur != profil_declare:
+        return refuser(root, f"agent {acteur} ne peut pas agir au nom du profil {profil_declare}",
+                       charge, meta, acteur=acteur, kind=kind)
+
+    # 3) operations
+    if op == "get":
+        return servir_get(root, charge, meta, acteur, kind)
+    if op == "list":
+        return {"ok": True, "inventaire": V.inventaire(root)}
+    if op in ("put", "rotate", "revoke", "grant", "revoke_grant"):
+        try:
+            return servir_ecriture(root, charge, meta, acteur, kind)
+        except (V.SecretRefus, V.SecretIndisponible) as exc:
+            journalise = False
+            try:
+                journaliser(root, "secret_write_denied",
+                            target="vault:" + str(charge.get("secret") or "?"),
+                            acteur=acteur, kind=kind, token=charge.get("actor_token"),
+                            credential=charge.get("actor_credential"),
+                            correlation_id=charge.get("correlation_id") or "vault",
+                            action=op, detail={"motif": str(exc)[:400]})
+                journalise = True
+            except Exception:  # noqa: BLE001
+                pass
+            return {"ok": False, "error": str(exc), "refus": True, "journalise": journalise}
+    if op == "verify":
+        return {"ok": True, "verification": V.verifier_coffre(root)}
+    return {"ok": False, "error": f"operation inconnue : {op!r}"}
+
+
+def serve(root):
+    sp = chemin_socket(root)
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    if sp.exists() or sp.is_symlink():
+        sp.unlink()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sp))
+    pol = V.politique(root)
+    socket_gid = pol["rules"].get("socket_gid")
+    if socket_gid is None:
+        os.chmod(sp, 0o600)
+    else:
+        if not isinstance(socket_gid, int) or socket_gid < 0:
+            raise V.SecretRefus("socket_gid invalide")
+        os.chown(sp.parent, os.getuid(), socket_gid)
+        os.chmod(sp.parent, 0o750)
+        os.chown(sp, os.getuid(), socket_gid)
+        os.chmod(sp, 0o660)
+    srv.listen(16)
+    srv.settimeout(1.0)
+    ETAT["socket"] = str(sp)
+    try:
+        journaliser(root, "secret_vault_started", target="vault:service",
+                    acteur=acteur_service(), kind="agent",
+                    detail={"socket": str(sp), "racine": str(root)})
+    except Exception as exc:  # noqa: BLE001 - le service demarre sans trace : signale sur stderr
+        print(f"AVERTISSEMENT: journalisation d'ouverture impossible ({exc})", file=sys.stderr)
+    print(json.dumps({"pret": True, "socket": str(sp)}), flush=True)
+    while not STOP["demande"]:
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        with conn:
+            try:
+                rep = traiter(conn, root)
+            except AUD.AuditIndisponible as exc:
+                rep = {"ok": False, "refus": True,
+                       "error": f"journal d'audit indisponible : {exc} — action refusee (fail-closed)"}
+            except AUD.AuditRefus as exc:
+                rep = {"ok": False, "refus": True, "error": f"journal d'audit refuse : {exc}"}
+            except (V.SecretRefus, V.SecretIndisponible) as exc:
+                rep = {"ok": False, "error": str(exc), "refus": True}
+            except Exception as exc:  # noqa: BLE001
+                rep = {"ok": False, "error": f"erreur interne du coffre : {exc}", "refus": True}
+            try:
+                conn.sendall((json.dumps(rep, ensure_ascii=False) + "\n").encode("utf-8"))
+            except OSError:
+                pass
+    srv.close()
+    if sp.exists():
+        sp.unlink()
+    return 0
+
+
+def main(argv=None):
+    sp = argparse.ArgumentParser(prog="awema-vaultd")
+    sub = sp.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("serve")
+    s.add_argument("--root", default=None)
+    args = sp.parse_args(argv)
+
+    def stop(_sig, _frm):
+        STOP["demande"] = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    root = V.racine(args.root)
+    try:
+        return serve(root)
+    finally:
+        pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

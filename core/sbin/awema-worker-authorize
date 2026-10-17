@@ -1,0 +1,61 @@
+from pathlib import Path
+import sys,importlib.machinery,importlib.util,json,hashlib,os,argparse,time,secrets,fcntl,stat
+if os.getuid()!=0:raise RuntimeError('operator root only')
+loader=importlib.machinery.SourceFileLoader('launcher','/usr/local/lib/awema-worker-launcher/awema-worker-launcher');spec=importlib.util.spec_from_loader(loader.name,loader);m=importlib.util.module_from_spec(spec);loader.exec_module(m)
+def verified_registry(role,authorization,action,expected_uid=None):
+ registry=m.BASE/'registry/execution-v2.json'
+ if registry.parent.is_symlink() or registry.is_symlink():raise ValueError('registry symlink denied')
+ parent=registry.parent.stat();expected_uid=os.geteuid() if expected_uid is None else expected_uid
+ if parent.st_uid!=expected_uid or parent.st_mode&0o022:raise ValueError('registry parent trust denied')
+ fd=os.open(registry,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ with os.fdopen(fd,'rb') as source:
+  info=os.fstat(source.fileno())
+  if not stat.S_ISREG(info.st_mode) or info.st_uid!=expected_uid or info.st_mode&0o022 or info.st_size>131072:raise ValueError('registry trust boundary denied')
+  data=source.read(131073)
+ if len(data)>131072:raise ValueError('registry size denied')
+ policy=json.loads(data);digest=hashlib.sha256(data).hexdigest()
+ if policy.get('version')!=2 or policy.get('board')!='awema-agency' or policy.get('project')!='awema-ai-team' or policy.get('sensitive_actions_enabled') is not False:raise ValueError('registry scope denied')
+ selected=policy.get('roles',{}).get(role)
+ if not selected or selected.get('enabled') is not True or selected.get('uid')!=m.UIDS.get(role) or selected.get('route')!='native-isolated' or selected.get('toolsets')!=['terminal','file'] or action not in selected.get('actions',[]) or selected.get('projects')!=['awema-ai-team']:raise ValueError('registry permission or route denied')
+ if authorization.get('registry_sha256') not in (None,digest):raise ValueError('registry version mismatch')
+ authorization['registry_sha256']=digest
+ return selected
+p=argparse.ArgumentParser();p.add_argument('--task',required=True);p.add_argument('--project',choices=['awema-ai-team'],required=True);p.add_argument('--inputs',default='[]');p.add_argument('--requires',default='[]');p.add_argument('--replace-expected-sha256');args=p.parse_args()
+row=m.row(args.task)
+if not row or row['assignee'] not in m.UIDS or row['status'] not in ['todo','ready','blocked']:raise RuntimeError('task not eligible for registration')
+if row['project_id'] not in [None,'awema-ai-team']:raise RuntimeError('native client project denied')
+inputs=[]
+for name in json.loads(args.inputs):
+ path=Path(name)
+ if any(p.is_symlink() for p in [path,*path.parents]) or path.name in ['TASK.json','RESULT.json','auth.json','tokens.json'] or path.suffix not in ['.json','.md','.py','.txt']:raise RuntimeError('nonsecret input boundary denied')
+ fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+ with os.fdopen(fd,'rb') as source:
+  info=os.fstat(source.fileno());resolved=os.readlink('/proc/self/fd/'+str(source.fileno()))
+  if not stat.S_ISREG(info.st_mode) or info.st_size>(16*1024*1024 if path.name in ('dev-WEB_PROJECT.json','PREVIOUS-WEB_PROJECT.json','RECOVERY-WEB_PROJECT.json') else 1024*1024) or not any(resolved.startswith(prefix) for prefix in ['/opt/awema-ai/workspace/','/opt/awema-ops/worker-launcher/handoffs/']):raise RuntimeError('opened source outside approved boundary')
+  data=source.read((16*1024*1024 if path.name in ('dev-WEB_PROJECT.json','PREVIOUS-WEB_PROJECT.json','RECOVERY-WEB_PROJECT.json') else 1024*1024)+1)
+  if len(data)>(16*1024*1024 if path.name in ('dev-WEB_PROJECT.json','PREVIOUS-WEB_PROJECT.json','RECOVERY-WEB_PROJECT.json') else 1024*1024):raise RuntimeError('bounded input exceeded')
+ if path.name in ('dev-WEB_PROJECT.json','PREVIOUS-WEB_PROJECT.json','RECOVERY-WEB_PROJECT.json'):m.web_project.load_project(data)
+ inputs.append({'path':str(path),'name':path.name,'sha256':hashlib.sha256(data).hexdigest()})
+if len({i['name'] for i in inputs})!=len(inputs):raise RuntimeError('input filename collision')
+authorization={'project':args.project,'task':args.task,'role':row['assignee'],'digest':m.digest(row),'inputs':inputs,'requires':json.loads(args.requires),'operator_uid':0,'confirmed':False,'expires':time.time()+3600,'consumed_run':None}
+verified_registry(row['assignee'],authorization,'launch')
+target=m.ROOT/'tasks'/(args.task+'.json')
+if target.exists() and not args.replace_expected_sha256:raise RuntimeError('existing authorization preserved; explicit CAS renewal required')
+correlation=secrets.token_hex(16)
+def journal(event):
+ m.AUD.emettre(m.BASE/'core',event,tool='awema-worker-authorize',target='kanban:'+args.task,correlation_id=correlation,acteur='worker-launcher',token=Path('/etc/awema/v2/tokens/worker-launcher.token').read_text(),task='TASK-NATIVE-'+args.task[2:],project=args.project,detail={'role':row['assignee'],'task_digest':authorization['digest'],'registry_sha256':authorization['registry_sha256'],'input_count':len(inputs)})
+with (m.ROOT/'authorization.lock').open('a') as lock:
+ fcntl.flock(lock,fcntl.LOCK_EX)
+ if target.exists():
+  old=target.read_bytes();actual=hashlib.sha256(old).hexdigest()
+  if actual!=args.replace_expected_sha256:raise RuntimeError('concurrent authorization preserved')
+  history=m.ROOT/'authorization-history';history.mkdir(mode=0o700,exist_ok=True);saved=history/(args.task+'-'+actual+'.json')
+  if not saved.exists():
+   fd=os.open(saved,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+   with os.fdopen(fd,'wb') as f:f.write(old);f.flush();os.fsync(f.fileno())
+   fd=os.open(history,os.O_RDONLY|os.O_DIRECTORY)
+   try:os.fsync(fd)
+   finally:os.close(fd)
+ elif args.replace_expected_sha256:raise RuntimeError('renewal preimage absent')
+ journal('worker_authorization_intent');m.save(target,authorization);journal('worker_authorization_confirmed');authorization['confirmed']=True;m.save(target,authorization)
+print(json.dumps({'task':args.task,'role':row['assignee'],'digest':authorization['digest'],'inputs':len(inputs),'project':args.project,'journalise':True,'grant_expires':authorization['expires']}))

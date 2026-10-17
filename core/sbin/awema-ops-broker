@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+import json,os,socket,struct,socketserver,secrets,subprocess,threading,time,sys,grp,re
+from pathlib import Path
+sys.path.insert(0,'/usr/local/lib/awema-broker')
+from awema_broker_lib import ApprovalStore,snapshot,secure_bytes,atomic,lock
+B=Path('/opt/awema-ops/broker');SOCKET=Path('/opt/awema-ai/core/data/broker/ops.sock')
+class Broker:
+ def __init__(self,root=B,auditor=None,backend=None):self.root=root;self.store=ApprovalStore(root/'approvals');self.auditor=auditor or self.audit;self.backend=backend or self.execute
+ def audit(self,event,detail):
+  sys.path.insert(0,'/opt/awema-ai/core/bin');import awema_audit_lib as audit
+  task='TASK-NATIVE-'+detail['task'][2:] if detail['task'].startswith('t_') else detail['task']
+  audit.emettre('/opt/awema-ai/core',event,tool='awema-ops-broker',target='snapshot:'+detail['digest'],correlation_id=detail['operation'],acteur='broker-service',token=Path('/etc/awema/v2/tokens/broker-service.token').read_text(),task=task,project='awema-jury',detail={k:v for k,v in detail.items() if k not in ['operation','task']})
+ def execute(self,data,operation,verb):
+  folder=self.root/'transactions'/operation;folder.mkdir(mode=0o700)
+  compose=folder/'compose.json';atomic(compose,data)
+  # Fixed immutable image IDs; no shell, mutable backend, pull, build or down.
+  command=['/usr/bin/docker','compose','--project-name','awema-jury','--project-directory','/opt/awema-jury','--file',str(compose),'up','-d','--no-deps','--no-build','--pull','never','office','owner']
+  with (folder/'stdout.log').open('xb') as out,(folder/'stderr.log').open('xb') as err:
+   rc=subprocess.run(command,stdout=out,stderr=err,timeout=180,env={'PATH':'/usr/bin:/bin','DOCKER_HOST':'unix:///var/run/docker.sock','DOCKER_CONFIG':'/run/awema-ops-broker'}).returncode
+  return rc
+ def handle(self,q,uid):
+  if uid not in [0,10000]:return self.deny(uid)
+  if isinstance(q,dict) and set(q)=={'verb'} and q['verb'] in ['status','versions','artifact-version']:return self.readonly(q['verb'],uid)
+  if not isinstance(q,dict) or set(q)!={'verb','task','project','approval_id','artifact_digest'} or q['verb'] not in ['deploy','rollback'] or q['project']!='awema-jury' or not isinstance(q['task'],str) or not re.fullmatch(r'(?:TASK-[A-Za-z0-9-]{1,80}|t_[a-f0-9]{8})',q['task']) or not isinstance(q['artifact_digest'],str) or not re.fullmatch('[a-f0-9]{64}',q['artifact_digest']):return self.deny(uid)
+  reserved=False;effect=False;operation=secrets.token_hex(16);detail={'operation':operation,'task':q['task'],'digest':q['artifact_digest'],'verb':q['verb'],'peer_uid':uid}
+  try:
+   with lock(self.root/'transaction.lock',True):
+    gate=json.loads(secure_bytes(self.root/'readiness.gate.json',4096))
+    if gate.get('sensitive_actions_enabled') is not True:raise PermissionError('closed gate')
+    data,manifest=snapshot(self.root,q['artifact_digest'],self.root/'template/compose.json')
+    self.auditor('broker_intent',detail) # before reservation OR external effect
+    self.store.reserve(q['approval_id'],'production_deploy' if q['verb']=='deploy' else 'production_rollback',q['task'],q['project'],q['verb'],q['artifact_digest']);reserved=True
+    # All publishers must use transaction.lock. Cached validated bytes are used.
+    effect=True;rc=self.backend(data,operation,q['verb'])
+    self.store.finish(q['approval_id'],rc==0)
+    self.auditor('broker_confirmed',dict(detail,rc=rc))
+    return {'ok':rc==0,'rc':rc,'operation':operation,'journalise':True,'retry_allowed':False}
+  except Exception:
+   if reserved:
+    try:self.store.finish(q['approval_id'],False)
+    except Exception:pass
+   try:self.auditor('broker_denied' if not effect else 'broker_effect_uncertain',detail)
+   except Exception:pass
+   return {'ok':False,'error':'broker_refused' if not effect else 'effect_uncertain','effect_uncertain':effect,'retry_allowed':False,'operation':operation}
+ def deny(self,uid):
+  acknowledged=False
+  try:self.auditor('broker_rpc_denied',{'operation':secrets.token_hex(16),'task':'TASK-BROKER-REQUEST','digest':'0'*64,'verb':'denied','peer_uid':uid});acknowledged=True
+  except Exception:pass
+  return {'ok':False,'error':'request_denied','journalise':acknowledged,'retry_allowed':False}
+ def docker_metadata(self,field):
+  if field not in ['running','image']:raise ValueError('fixed metadata')
+  result={};deadline=time.monotonic()+3
+  for role,name in [('office','awema-jury-office'),('owner','awema-owner-portal')]:
+   remaining=deadline-time.monotonic()
+   if remaining<=0:raise TimeoutError()
+   fmt='{{.State.Running}}' if field=='running' else '{{.Image}}'
+   p=subprocess.run(['/usr/bin/docker','inspect','--type','container','--format',fmt,name],capture_output=True,text=True,timeout=remaining,check=True,env={'PATH':'/usr/bin:/bin','DOCKER_HOST':'unix:///var/run/docker.sock','DOCKER_CONFIG':'/run/awema-ops-broker'})
+   if len(p.stdout)>128:raise ValueError('bounded metadata')
+   value=p.stdout.strip()
+   if field=='running':
+    if value not in ['true','false']:raise ValueError('running metadata')
+    value=value=='true'
+   elif not re.fullmatch('sha256:[a-f0-9]{64}',value):raise ValueError('image metadata')
+   result[role]=value
+  return result
+ def readonly(self,verb,uid):
+  detail={'operation':secrets.token_hex(16),'task':'TASK-BROKER-READ','digest':'0'*64,'verb':verb,'peer_uid':uid}
+  try:
+   self.auditor('broker_read_intent',detail)
+   if verb=='artifact-version':
+    with lock(self.root/'transaction.lock'):
+     target=json.loads(secure_bytes(self.root/'current-snapshot.json',128))
+     snapshot(self.root,target,self.root/'template/compose.json')
+     detail['digest']=target;data={'artifact_digest':target}
+   elif verb=='status':
+    gate=json.loads(secure_bytes(self.root/'readiness.gate.json',4096));data={'gate_enabled':gate.get('sensitive_actions_enabled') is True,'running':self.docker_metadata('running')}
+   else:data={'images':self.docker_metadata('image')}
+   self.auditor('broker_read_confirmed',detail)
+   return {'ok':True,**data,'journalise':True}
+  except Exception:return self.deny(uid)
+BROKER=Broker()
+class Handler(socketserver.StreamRequestHandler):
+ def handle(self):
+  self.connection.settimeout(5);deadline=time.monotonic()+5
+  try:
+   _,uid,_=struct.unpack('3i',self.connection.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+   if uid not in [0,10000]:response=BROKER.deny(uid)
+   else:
+    raw=b''
+    while b'\n' not in raw:
+     remaining=deadline-time.monotonic()
+     if remaining<=0:raise TimeoutError()
+     self.connection.settimeout(remaining);part=self.connection.recv(min(4096,16385-len(raw)))
+     if not part:raise ValueError()
+     raw+=part
+     if len(raw)>16384:raise ValueError()
+    if raw.count(b'\n')!=1 or not raw.endswith(b'\n'):raise ValueError()
+    response=BROKER.handle(json.loads(raw),uid)
+   self.wfile.write((json.dumps(response)+'\n').encode())
+  except Exception:
+   try:self.wfile.write((json.dumps(BROKER.deny(locals().get('uid')))+'\n').encode())
+   except OSError:pass
+class Server(socketserver.ThreadingUnixStreamServer):
+ daemon_threads=True
+ slots=threading.BoundedSemaphore(8)
+ def process_request(self,request,address):
+  if not self.slots.acquire(False):self.shutdown_request(request);return
+  try:super().process_request(request,address)
+  except Exception:self.slots.release();raise
+ def process_request_thread(self,request,address):
+  try:super().process_request_thread(request,address)
+  finally:self.slots.release()
+ def handle_error(self,*args):pass
+def serve():
+ os.umask(0o077)
+ if SOCKET.exists():raise RuntimeError('existing socket requires operator reconciliation')
+ with Server(str(SOCKET),Handler) as service:
+  os.chown(SOCKET,0,grp.getgrnam('awema-broker').gr_gid);SOCKET.chmod(0o660);service.serve_forever()
+if __name__=='__main__':serve()

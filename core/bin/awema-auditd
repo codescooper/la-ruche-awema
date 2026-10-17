@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""awema-auditd — service du magasin d'audit scelle (correction P0-3).
+
+C'est le SEUL ecrivain du journal. Il :
+
+  1. verifie la chaine et les signatures du journal existant avant tout service ;
+     si le journal est corrompu, il est mis en quarantaine et le service REFUSE
+     de demarrer (le magasin reste ferme : aucune action critique ne peut plus
+     etre tracee, donc aucune ne doit passer) ;
+  2. ouvre le journal en ajout et garde le descripteur, puis scelle le fichier en
+     0400 et le repertoire en 0500 : aucun autre processus (meme UID) ne peut
+     ouvrir le journal en ecriture, le renommer ou le supprimer ;
+  3. authentifie chaque demande (jeton d'acteur + identite noyau SO_PEERCRED +
+     commande reelle lue dans /proc), refuse les champs reserves fournis par le
+     client, attribue seq / ts / ancre monotone, chaine et signe l'entree ;
+  4. n'accuse reception qu'apres ecriture + fsync effectifs.
+
+Options internes de test : AWEMA_AUDIT_FAULT=write simule une panne d'ecriture.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import socket
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_audit_lib as AUD  # noqa: E402
+
+STOP = {"demande": False}
+ETAT = {}
+
+
+def _journaliser(fd, entree, k, etat):
+    entree["hash"] = AUD.calcul_hash(entree, entree["prev_hash"])
+    entree["sig"] = AUD.signer(entree["hash"], k)
+    motif = AUD.valider_entree(entree)
+    if motif:
+        raise AUD.AuditRefus("entree non conforme (service) : " + motif)
+    ligne = json.dumps(entree, ensure_ascii=False)
+    if len(ligne) > AUD.MAX_LIGNE:
+        raise AUD.AuditRefus("entree trop volumineuse")
+    avant = os.fstat(fd).st_size
+    os.write(fd, (ligne + "\n").encode("utf-8"))
+    os.fsync(fd)
+    apres = os.fstat(fd).st_size
+    if apres <= avant:
+        raise AUD.AuditIndisponible("ecriture d'audit non confirmee (taille inchangee)")
+    etat["seq"] = entree["seq"]
+    etat["prev_hash"] = entree["hash"]
+    return entree
+
+
+def _refus_trace(root, fd, k, etat, meta, motif, charge=None, acteur=None, kind=None):
+    """Trace un refus d'audit (best effort) : un refus non attribuable reste sur stderr."""
+    if fd is None:
+        return None
+    charge = charge or {}
+    try:
+        entree = AUD.construire_entree(
+            {"event": "audit_refused", "tool": charge.get("tool") or "awema-auditd",
+             "actor_declare": charge.get("actor_declare"),
+             "action": charge.get("action"), "target": charge.get("target") or "audit-store",
+             "task": charge.get("task"), "project": charge.get("project"),
+             "correlation_id": charge.get("correlation_id") or "audit-store",
+             "detail": {"motif": motif[0:400]},
+             "_actor": acteur or "awema-auditd", "_kind": kind or "agent"},
+            {"pid": meta.get("pid") or os.getpid(), "uid": meta.get("uid") or os.getuid()},
+            etat["prev_hash"], etat["seq"] + 1, etat["anchor_id"])
+        return _journaliser(fd, entree, k, etat)
+    except (AUD.AuditRefus, AUD.AuditIndisponible, OSError):
+        return None
+
+
+def traiter(conn, root, k, fd, etat):
+    brut = b""
+    conn.settimeout(10.0)
+    while b"\n" not in brut:
+        bloc = conn.recv(65536)
+        if not bloc:
+            break
+        brut += bloc
+    if not brut.strip():
+        return {"ok": False, "error": "requete vide"}
+    try:
+        charge = json.loads(brut.decode("utf-8").splitlines()[0])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"ok": False, "error": "requete illisible"}
+    if not isinstance(charge, dict):
+        return {"ok": False, "error": "requete non objet"}
+    op = charge.get("op")
+    if op == "ping":
+        return {"ok": True, "service": "awema-auditd", "anchor": etat["anchor_id"],
+                "seq": etat["seq"], "pid": os.getpid()}
+    if op == "verify":
+        return {"ok": True, "rapport": AUD.verifier_journal(root, k)}
+    if op != "append":
+        return {"ok": False, "error": f"operation inconnue : {op!r}"}
+
+    meta = AUD.pid_et_uid_client(conn)
+    interdits = [c for c in AUD.CHAMPS_INTERDITS if c in charge]
+    if interdits:
+        motif = "champs reserves fournis par le client : " + ",".join(sorted(interdits))
+        _refus_trace(root, fd, k, etat, meta, motif, charge)
+        return {"ok": False, "error": "detournement refuse : " + motif}
+    tool = charge.get("tool")
+    if not isinstance(tool, str) or not AUD.TOOL_RE.match(tool):
+        motif = f"outil declare malforme : {tool!r}"
+        _refus_trace(root, fd, k, etat, meta, motif, charge)
+        return {"ok": False, "error": motif}
+    reel = AUD.commande_reelle(meta["pid"], tool)
+    if reel is False:
+        motif = f"detournement refuse : la commande reelle du client n'est pas {tool}"
+        _refus_trace(root, fd, k, etat, meta, motif, charge)
+        return {"ok": False, "error": motif}
+    try:
+        actor, kind = AUD.authentifier(root, charge.get("actor_token"), charge.get("actor_declare"),
+                                       charge.get("actor_credential"))
+    except AUD.AuditIdentityMismatch as exc:
+        _refus_trace(
+            root, fd, k, etat, meta, str(exc), charge,
+            acteur=exc.actor, kind=exc.kind
+        )
+        return {"ok": False, "error": str(exc)}
+    except AUD.AuditRefus as exc:
+        _refus_trace(root, fd, k, etat, meta, str(exc), charge)
+        return {"ok": False, "error": str(exc)}
+    except AUD.AuditIndisponible as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        entree = AUD.construire_entree({**charge, "_actor": actor, "_kind": kind}, meta,
+                                       etat["prev_hash"], etat["seq"] + 1, etat["anchor_id"])
+        entree["detail"] = {**entree["detail"], "tool_verifiee": reel is not False}
+        if os.environ.get("AWEMA_AUDIT_FAULT") == "write":
+            raise AUD.AuditIndisponible("panne d'ecriture simulee (injection de defaut)")
+        entree = _journaliser(fd, entree, k, etat)
+    except (AUD.AuditRefus, AUD.AuditIndisponible) as exc:
+        return {"ok": False, "error": str(exc)}
+    except OSError as exc:
+        return {"ok": False, "error": f"panne d'ecriture du journal : {exc}"}
+    return {"ok": True, "entry": entree}
+
+
+def _desceller(root):
+    d = AUD.journal_path(root).parent
+    f = AUD.journal_path(root)
+    if d.exists():
+        os.chmod(d, 0o700)
+    if f.exists():
+        os.chmod(f, 0o600)
+
+
+def _sceller(root):
+    f = AUD.journal_path(root)
+    d = f.parent
+    if f.exists():
+        os.chmod(f, 0o400)
+    os.chmod(d, 0o500)
+
+
+def _lire_queue(root):
+    entrees = AUD.lire_journal(root)
+    dernier = AUD.dernier(entrees)
+    if dernier is None:
+        return 0, AUD.GENESIS
+    return int(dernier["seq"]), str(dernier["hash"])
+
+
+def demarrer(root) -> int:
+    root = Path(root)
+    (root / "data/locks").mkdir(parents=True, exist_ok=True)
+    pid_file = AUD.pid_path(root)
+    if pid_file.exists():
+        try:
+            ancien = int(pid_file.read_text().split()[0])
+            os.kill(ancien, 0)
+            print(f"AUDIT_REFUS: service deja actif (pid {ancien})", file=sys.stderr)
+            return 2
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+    k = AUD.cle(root)
+    jp = AUD.journal_path(root)
+
+    # Un magasin sans segment actif est valide pour un nouveau depart
+    # (premier demarrage ou reprise apres quarantaine explicite).
+    # Un segment existant doit en revanche etre integralement conforme.
+    if jp.exists():
+        rapport = AUD.verifier_journal(root, k)
+        if rapport["ecarts"]:
+            _desceller(root)
+            cible = AUD.quarantaine_journal(
+                root,
+                "journal corrompu : " + rapport["ecarts"][0]["motif"]
+            )
+            _sceller(root)
+            print(
+                f"AUDIT_REFUS: journal corrompu ({len(rapport['ecarts'])} ecart(s)) — "
+                f"quarantaine {cible} — service NON demarre",
+                file=sys.stderr
+            )
+            return 3
+
+    _desceller(root)
+    jp = AUD.journal_path(root)
+    fd = os.open(jp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    seq, prev_hash = _lire_queue(root)
+    # le repertoire doit accepter le socket avant scellement
+    os.chmod(jp, 0o600)
+    sp = AUD.socket_path(root)
+    if sp.exists():
+        sp.unlink()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sp))
+    os.chmod(sp, 0o660)
+    srv.listen(16)
+    srv.settimeout(1.0)
+    etat = {"seq": seq, "prev_hash": prev_hash,
+            "anchor_id": "auditd-" + os.urandom(6).hex()}
+    pid_file.write_text(f"{os.getpid()} {AUD.maintenant()}\n", encoding="utf-8")
+    os.chmod(pid_file, 0o600)
+    _sceller(root)
+    print(f"AUDITD_READY pid={os.getpid()} seq={seq} socket={sp}", flush=True)
+
+    def _arret(_sig, _frm):
+        STOP["demande"] = True
+
+    signal.signal(signal.SIGTERM, _arret)
+    signal.signal(signal.SIGINT, _arret)
+    while not STOP["demande"]:
+        try:
+            conn, _ = srv.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            rep = traiter(conn, root, k, fd, etat)
+        except Exception as exc:  # jamais de mutation sans trace : on repond en refus
+            rep = {"ok": False, "error": f"erreur interne du magasin : {type(exc).__name__}"}
+        try:
+            conn.sendall((json.dumps(rep, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    srv.close()
+    os.close(fd)
+    # arret : le journal reste scelle en 0400 ; seul un demarrage peut le rouvrir
+    os.chmod(AUD.journal_path(root).parent, 0o700)
+    try:
+        sp.unlink()
+    except OSError:
+        pass
+    try:
+        pid_file.unlink()
+    except OSError:
+        pass
+    _sceller(root)
+    print("AUDITD_STOPPED", flush=True)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="awema-auditd")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    sp.add_parser("serve")
+    sp.add_parser("stop")
+    sp.add_parser("status")
+    a = ap.parse_args(argv)
+    root = AUD.racine()
+
+    if a.cmd == "serve":
+        return demarrer(root)
+    if a.cmd == "status":
+        p = AUD.pid_path(root)
+        vivant = False
+        if p.exists():
+            try:
+                os.kill(int(p.read_text().split()[0]), 0)
+                vivant = True
+            except (OSError, ValueError):
+                vivant = False
+        print(json.dumps({"service": "awema-auditd", "actif": vivant,
+                          "pid_file": str(p), "journal": str(AUD.journal_path(root))}, indent=2))
+        return 0 if vivant else 1
+    # stop
+    p = AUD.pid_path(root)
+    if not p.exists():
+        print("AUDIT_REFUS: aucun service declare", file=sys.stderr)
+        return 2
+    pid = int(p.read_text().split()[0])
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print(f"AUDIT_REFUS: arret impossible ({exc})", file=sys.stderr)
+        return 2
+    for _ in range(100):
+        if not p.exists():
+            break
+        time.sleep(0.05)
+    print("AUDITD_STOPPED")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,16 @@
+.studio:not(.chat-only) .studio-toolbar :is(button,select){min-height:42px}
+.studio:not(.chat-only) .studio-toolbar select option,.studio:not(.chat-only) .studio-chat select option{color:#f5f5f0;background:#20221f}
+.studio:not(.chat-only) .studio-toolbar .has-review{background:#f5c400;color:#171816;border:2px solid #fff0a3;font-weight:800;box-shadow:0 0 0 2px #f5c40055}
+.studio:not(.chat-only) .studio-chat:has(>h2){overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-color:#6d6f5e #20221f}
+.studio:not(.chat-only) .studio-chat:has(>h2)>.studio-messages{flex:1 0 auto;min-height:140px;max-height:min(42dvh,390px);overscroll-behavior:contain}
+.studio-results-summary{position:sticky;top:0;z-index:1;margin:0;padding:9px 11px;border:1px solid #56574a;border-radius:9px;background:#20221f;color:#f5e2a3;font-weight:700}
+.studio-mission-card{display:grid;gap:5px}
+.studio-mission-card .studio-open-result{min-height:44px;white-space:normal;text-align:left;color:#171816;background:#f5d547;border-color:#f5d547;font-weight:750}
+.studio-results-ready{margin:2px 0;padding:8px 10px;border-left:3px solid #f5c400;background:#34352a;color:#fff1ae;font-size:12px;font-weight:650}
+.studio:not(.chat-only) .studio-chat:has(>h2) .studio-compose{flex:none;gap:8px;padding:10px;border:1px solid #55564a;border-radius:10px;background:#272923}
+.studio:not(.chat-only) .studio-chat:has(>h2) .studio-compose textarea{width:100%;min-height:76px;max-height:160px;resize:vertical;color:#f5f5f0;background:#191a17;border-color:#68695b}
+.studio:not(.chat-only) .studio-chat:has(>h2) .studio-compose button{min-height:44px;white-space:normal}
+.studio:not(.chat-only) .studio-chat:has(>h2) .studio-compose-actions button{min-height:42px}
+.studio:not(.chat-only) .studio-dialog button,.studio:not(.chat-only) .studio-dialog a{min-height:42px}
+.studio:not(.chat-only) :is(button,select,textarea):focus-visible{outline:3px solid #ffe04b;outline-offset:2px}
+@media(max-width:760px){.studio:not(.chat-only) .studio-chat:has(>h2)>.studio-messages{max-height:35dvh;min-height:100px}.studio:not(.chat-only) .studio-mission-card .studio-open-result{width:100%}.studio:not(.chat-only) .studio-toolbar{scrollbar-width:thin}.studio:not(.chat-only) .studio-toolbar :is(button,select){flex:none;min-height:42px}}

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""awema-taskctl — criteres de completion et requeue (durci P0-3).
+
+Delta vs la version d'origine (C-06) : le journal est ecrit AVANT la mutation et
+une defaillance d'audit refuse l'action ; l'ecriture du fichier de tache est
+durable (fsync fichier + repertoire). L'entree `criteria_updated` porte desormais
+les items de criteres et non un simple compteur (C-09).
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_approval_lib as A  # noqa: E402
+
+ROOT = Path(os.environ.get("AWEMA_CORE_ROOT", "/awema-core"))
+TASKS = ROOT / "data/tasks"
+
+
+def save(p, o):
+    tmp = p.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(o, ensure_ascii=False, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+    try:
+        dfd = os.open(p.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def load(t):
+    p = TASKS / (t + ".json")
+    if not p.exists():
+        raise A.Refus("tache inexistante: " + t)
+    return p, json.loads(p.read_text(encoding="utf-8"))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="awema-taskctl")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    c = sp.add_parser("criteria")
+    c.add_argument("task")
+    c.add_argument("items", nargs="+")
+    c.add_argument("--actor", default="coordinator")
+    r = sp.add_parser("requeue")
+    r.add_argument("task")
+    r.add_argument("--by", default="coordinator")
+    a = ap.parse_args(argv)
+    p, o = load(a.task)
+
+    if a.cmd == "criteria":
+        items = [str(x)[:200] for x in a.items][:50]
+        A.journal(ROOT, "criteria_updated", task=a.task, actor=a.actor,
+                  items=items, count=len(items))
+        o["completion_criteria"] = items
+    else:
+        A.journal(ROOT, "task_requeued", task=a.task, actor=a.by,
+                  assignee="coordinator", status="todo")
+        o["assignee"] = "coordinator"
+        o["status"] = "todo"
+        o.pop("runtime_processed_at", None)
+    o["updated_at"] = A.now()
+    try:
+        save(p, o)
+    except OSError as exc:
+        raise A.Refus(f"ecriture de la tache impossible ({exc}) — mutation annulee")
+    print("OK")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except A.Refus as exc:
+        try:
+            A.journal(ROOT, "approval_refused", tool="awema-taskctl", detail=str(exc))
+        except A.Refus:
+            pass
+        print("REFUS: " + str(exc), file=sys.stderr)
+        sys.exit(64)

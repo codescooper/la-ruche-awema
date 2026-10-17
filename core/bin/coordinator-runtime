@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""coordinator-runtime — routage des taches (durci P0-3).
+
+Delta vs la version d'origine (C-06) : chaque mutation (blocage pour champs
+manquants, blocage unroutable, routage) ecrit d'abord une entree d'audit ; si le
+magasin d'audit est indisponible, l'iteration s'arrete en REFUS sans rien
+modifier — un routage sans trace n'est pas permis. Le journal reste la seule
+voie d'ecriture (aucun acces direct a data/audit/events.jsonl).
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import awema_approval_lib as A  # noqa: E402
+
+ROOT = Path(os.environ.get("AWEMA_CORE_ROOT", "/awema-core"))
+TASKS = ROOT / "data/tasks"
+STATE = ROOT / "data/runtime"
+STATE.mkdir(parents=True, exist_ok=True)
+
+AGENT = "coordinator"
+TECH = ("code", "bug", "api", "architecture", "test", "github", "repo", "develop", "dev",
+        "logiciel", "site")
+CREATIVE = ("visuel", "creative", "créa", "contenu", "campagne", "copy", "video", "image",
+            "design", "prompt")
+BUSINESS = ("prospect", "client", "devis", "commercial", "crm", "offre", "vente", "marché",
+            "business")
+OPS = ("vps", "serveur", "docker", "deploy", "déploiement", "backup", "sauvegarde", "dns",
+       "production", "monitor")
+
+
+def now():
+    return A.now()
+
+
+def save(p, o):
+    tmp = p.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(o, ensure_ascii=False, indent=2) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def route(o):
+    texte = " ".join([str(o.get("title", "")), str(o.get("objective", "")),
+                      str(o.get("context", ""))]).lower()
+    scores = {
+        "cto": sum(x in texte for x in TECH),
+        "creative": sum(x in texte for x in CREATIVE),
+        "business": sum(x in texte for x in BUSINESS),
+        "ops": sum(x in texte for x in OPS),
+    }
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else None
+
+
+def ready(o):
+    manquants = []
+    if not o.get("project"):
+        manquants.append("project")
+    if not o.get("objective"):
+        manquants.append("objective")
+    if not o.get("completion_criteria"):
+        manquants.append("completion_criteria")
+    return manquants
+
+
+def process(p):
+    o = json.loads(p.read_text(encoding="utf-8"))
+    if o.get("assignee") != "coordinator" or o.get("status") not in {"backlog", "todo", "in_progress"}:
+        return False
+    if o.get("runtime_processed_at"):
+        return False
+
+    manquants = ready(o)
+    if manquants:
+        A.journal(ROOT, "coordinator_blocked_incomplete", task=o["id"], actor=AGENT,
+                  missing=manquants)
+        o["status"] = "blocked"
+        o.setdefault("notes", []).append({
+            "by": "coordinator", "type": "clarification_required",
+            "value": "Champs requis manquants: " + ",".join(manquants), "at": now()})
+        o["runtime_processed_at"] = now()
+        save(p, o)
+        print(f'BLOCKED {o["id"]}: {",".join(manquants)}', flush=True)
+        return True
+
+    cible = route(o)
+    if not cible:
+        A.journal(ROOT, "coordinator_blocked_unroutable", task=o["id"], actor=AGENT)
+        o["status"] = "blocked"
+        o.setdefault("notes", []).append({
+            "by": "coordinator", "type": "clarification_required",
+            "value": "Aucun spécialiste déterminé automatiquement; validation humaine requise.",
+            "at": now()})
+        o["runtime_processed_at"] = now()
+        save(p, o)
+        print(f'BLOCKED {o["id"]}: unroutable', flush=True)
+        return True
+
+    A.journal(ROOT, "coordinator_routed", task=o["id"], actor=AGENT, agent=cible,
+              project=o.get("project"))
+    o["assignee"] = cible
+    o["assignee_type"] = "agent"
+    o["status"] = "todo"
+    o["routed_by"] = "coordinator"
+    o["routed_at"] = now()
+    o["runtime_processed_at"] = now()
+    save(p, o)
+    print(f'ROUTED {o["id"]} -> {cible}', flush=True)
+    return True
+
+
+def once():
+    compte = 0
+    refus = 0
+    for p in sorted(TASKS.glob("TASK-*.json")):
+        try:
+            compte += 1 if process(p) else 0
+        except A.Refus as exc:
+            refus += 1
+            print("REFUS: " + str(exc), file=sys.stderr, flush=True)
+            continue
+        except Exception as exc:
+            try:
+                A.journal(ROOT, "coordinator_error", task=p.stem, actor=AGENT,
+                          error=type(exc).__name__)
+            except A.Refus:
+                pass
+            print(f"ERROR {p.name}: {type(exc).__name__}", flush=True)
+    return compte, refus
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="coordinator-runtime")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--interval", type=int, default=15)
+    a = ap.parse_args(argv)
+    if a.once:
+        compte, refus = once()
+        print(f"processed={compte}")
+        # une passe qui n'a pas pu tracer n'est pas un succes silencieux
+        return 1 if refus else 0
+    print("AWEMA Coordinator Runtime started", flush=True)
+    while True:
+        once()
+        time.sleep(max(5, a.interval))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
